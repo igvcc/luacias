@@ -1,0 +1,26 @@
+# Build outputs
+target/
+bin/
+*.exe
+*.dll
+*.pdb
+*.dmp
+
+# Logs and runtime traces
+*.log
+trace*.log
+*.trace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Game assets & dumps (Never commit game assets)
+*.rpf
+*.ttpf
+*.pkg
+*.xbe
+dump/
+dumps/
+present_dumps/
