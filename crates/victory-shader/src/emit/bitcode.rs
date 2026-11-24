@@ -1,0 +1,1432 @@
+//! A DXIL module and its LLVM 3.7 bitcode, written with unabbreviated
+//! records only (the format DXIL fixes; codes from LLVM's `LLVMBitCodes.h`).
+//!
+//! Values are symbolic while the module is built ([`V`]) and numbered when
+//! it is written: functions, then constants (all at module level), then the
+//! instructions of `main` in block order.
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct Ty(u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TypeDef {
+    Void,
+    Int(u32),
+    Float,
+    /// Pointee and address space.
+    Ptr(Ty, u32),
+    Struct(Option<String>, Vec<Ty>),
+    Array(u32, Ty),
+    Func(Ty, Vec<Ty>),
+}
+
+/// A value: a global variable, a function, a module constant, or an
+/// instruction result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum V {
+    Global(u32),
+    Func(u32),
+    Const(u32),
+    Inst(u32),
+}
+
+/// A global variable declaration (thread-group shared memory).
+struct Global {
+    name: String,
+    ty: Ty,
+    /// Its pointer type.
+    ptr: Ty,
+    space: u32,
+    /// An internal constant with this initialiser (a constant table).
+    init: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Const {
+    Int(i64),
+    Float(u32),
+    Undef,
+    Aggregate(Vec<u32>),
+}
+
+/// LLVM binary opcodes (the same codes serve the float forms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bin {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    UDiv = 3,
+    SDiv = 4,
+    URem = 5,
+    Shl = 7,
+    LShr = 8,
+    AShr = 9,
+    And = 10,
+    Or = 11,
+    Xor = 12,
+}
+
+/// `atomicrmw` operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rmw {
+    Xchg = 0,
+    Add = 1,
+    Sub = 2,
+    And = 3,
+    Or = 5,
+    Xor = 6,
+    Max = 7,
+    Min = 8,
+    UMax = 9,
+    UMin = 10,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cast {
+    Trunc = 0,
+    ZExt = 1,
+    SExt = 2,
+    FpToUi = 3,
+    FpToSi = 4,
+    UiToFp = 5,
+    SiToFp = 6,
+    Bitcast = 11,
+}
+
+/// Compare predicates: floats 0-15, integers 32-41.
+pub(crate) mod pred {
+    pub const FALSE: u8 = 0;
+    pub const OEQ: u8 = 1;
+    pub const OGT: u8 = 2;
+    pub const OGE: u8 = 3;
+    pub const OLT: u8 = 4;
+    pub const OLE: u8 = 5;
+    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
+    // lowers as OLT | OGT instead.
+    #[allow(dead_code)]
+    pub const ONE: u8 = 6;
+    pub const ORD: u8 = 7;
+    pub const UNO: u8 = 8;
+    pub const UEQ: u8 = 9;
+    pub const UGT: u8 = 10;
+    pub const UGE: u8 = 11;
+    pub const ULT: u8 = 12;
+    pub const ULE: u8 = 13;
+    pub const UNE: u8 = 14;
+    pub const TRUE: u8 = 15;
+    pub const EQ: u8 = 32;
+    pub const NE: u8 = 33;
+    pub const IUGT: u8 = 34;
+    pub const IUGE: u8 = 35;
+    pub const IULT: u8 = 36;
+    pub const IULE: u8 = 37;
+    pub const SGT: u8 = 38;
+    pub const SGE: u8 = 39;
+    pub const SLT: u8 = 40;
+    pub const SLE: u8 = 41;
+}
+
+#[derive(Debug, Clone)]
+enum Op {
+    Bin(Bin, V, V),
+    Cast(Cast, V),
+    Cmp(u8, V, V),
+    Select(V, V, V),
+    Extract(V, u32),
+    Call(u32, Vec<V>),
+    /// Filled in later: (value, block).
+    Phi(Vec<(V, usize)>),
+    /// `getelementptr` over the pointee type, from a pointer.
+    Gep(Ty, V, Vec<V>),
+    Load(V),
+    /// Pointer, value.
+    Store(V, V),
+    AtomicRmw(Rmw, V, V),
+    /// Pointer, expected, new; returns `{i32, i1}`.
+    CmpXchg(V, V, V),
+}
+
+#[derive(Debug, Clone)]
+struct Inst {
+    ty: Ty,
+    op: Op,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Term {
+    Br(usize),
+    CondBr(V, usize, usize),
+    Ret,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Block {
+    phis: Vec<u32>,
+    body: Vec<u32>,
+    term: Option<Term>,
+}
+
+/// Function attributes of a `dx.op` declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attr {
+    ReadNone = 1,
+    NoUnwind = 2,
+    ReadOnly = 3,
+    /// Barriers.
+    NoDuplicate = 4,
+}
+
+struct Func {
+    name: String,
+    ty: Ty,
+    attr: Option<Attr>,
+    body: bool,
+}
+
+/// A metadata node operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Md(u32);
+
+enum MdDef {
+    Str(String),
+    Value(Ty, V),
+    Node(Vec<Option<Md>>),
+}
+
+#[derive(Default)]
+pub(crate) struct Module {
+    types: Vec<TypeDef>,
+    type_ids: HashMap<TypeDef, u32>,
+    consts: Vec<(Ty, Const)>,
+    const_ids: HashMap<(Ty, Const), u32>,
+    globals: Vec<Global>,
+    funcs: Vec<Func>,
+    func_ids: HashMap<String, u32>,
+    insts: Vec<Inst>,
+    blocks: Vec<Block>,
+    mds: Vec<MdDef>,
+    named: Vec<(String, Vec<Md>)>,
+}
+
+impl Module {
+    fn ty(&mut self, def: TypeDef) -> Ty {
+        if let Some(&t) = self.type_ids.get(&def) {
+            return Ty(t);
+        }
+        let t = self.types.len() as u32;
+        self.types.push(def.clone());
+        self.type_ids.insert(def, t);
+        Ty(t)
+    }
+
+    pub fn void(&mut self) -> Ty {
+        self.ty(TypeDef::Void)
+    }
+    pub fn int(&mut self, bits: u32) -> Ty {
+        self.ty(TypeDef::Int(bits))
+    }
+    pub fn float(&mut self) -> Ty {
+        self.ty(TypeDef::Float)
+    }
+    pub fn ptr(&mut self, to: Ty) -> Ty {
+        self.ty(TypeDef::Ptr(to, 0))
+    }
+    pub fn ptr_in(&mut self, to: Ty, space: u32) -> Ty {
+        self.ty(TypeDef::Ptr(to, space))
+    }
+    pub fn array(&mut self, n: u32, of: Ty) -> Ty {
+        self.ty(TypeDef::Array(n, of))
+    }
+    pub fn named_struct(&mut self, name: &str, fields: Vec<Ty>) -> Ty {
+        self.ty(TypeDef::Struct(Some(name.into()), fields))
+    }
+    pub fn func_ty(&mut self, ret: Ty, params: Vec<Ty>) -> Ty {
+        self.ty(TypeDef::Func(ret, params))
+    }
+
+    fn is_void(&self, t: Ty) -> bool {
+        self.types[t.0 as usize] == TypeDef::Void
+    }
+
+    fn constant(&mut self, ty: Ty, c: Const) -> V {
+        if let Some(&i) = self.const_ids.get(&(ty, c.clone())) {
+            return V::Const(i);
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push((ty, c.clone()));
+        self.const_ids.insert((ty, c), i);
+        V::Const(i)
+    }
+
+    pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
+        self.constant(ty, Const::Int(v))
+    }
+    pub fn i32(&mut self, v: u32) -> V {
+        let t = self.int(32);
+        self.int_const(t, i64::from(v as i32))
+    }
+    pub fn i8(&mut self, v: u8) -> V {
+        let t = self.int(8);
+        self.int_const(t, i64::from(v as i8))
+    }
+    pub fn bool(&mut self, v: bool) -> V {
+        let t = self.int(1);
+        self.int_const(t, -i64::from(v))
+    }
+    pub fn f32(&mut self, bits: u32) -> V {
+        let t = self.float();
+        self.constant(t, Const::Float(bits))
+    }
+    pub fn undef(&mut self, ty: Ty) -> V {
+        self.constant(ty, Const::Undef)
+    }
+    /// A constant struct or array of constants.
+    pub fn aggregate(&mut self, ty: Ty, fields: &[V]) -> V {
+        let ids = fields
+            .iter()
+            .map(|f| match f {
+                V::Const(i) => *i,
+                _ => panic!("aggregate of a non-constant"),
+            })
+            .collect();
+        self.constant(ty, Const::Aggregate(ids))
+    }
+
+    /// The value of an integer constant; `None` for anything else.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Gives constant `old` the content of `new` (both stay valid).
+    pub fn replace_const(&mut self, old: V, new: V) {
+        if let (V::Const(o), V::Const(n)) = (old, new) {
+            self.consts[o as usize] = self.consts[n as usize].clone();
+        }
+    }
+
+    /// A function declaration (or `main` with `body`), found by name.
+    pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
+        if let Some(&i) = self.func_ids.get(name) {
+            return V::Func(i);
+        }
+        let i = self.funcs.len() as u32;
+        self.funcs.push(Func {
+            name: name.into(),
+            ty,
+            attr,
+            body,
+        });
+        self.func_ids.insert(name.into(), i);
+        V::Func(i)
+    }
+
+    /// An external global of type `ty` in address space `space` (DXIL
+    /// declares thread-group shared memory this way).
+    pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {
+        let ptr = self.ptr_in(ty, space);
+        self.globals.push(Global {
+            name: name.into(),
+            ty,
+            ptr,
+            space,
+            init: None,
+        });
+        V::Global(self.globals.len() as u32 - 1)
+    }
+
+    /// An internal constant global initialised with the constant `init`.
+    pub fn constant_global(&mut self, name: &str, init: V) -> V {
+        let V::Const(i) = init else {
+            panic!("a global initialised with a non-constant")
+        };
+        let ty = self.consts[i as usize].0;
+        let g = self.global(name, ty, 0);
+        if let V::Global(n) = g {
+            self.globals[n as usize].init = Some(i);
+        }
+        g
+    }
+
+    pub fn new_block(&mut self) -> usize {
+        self.blocks.push(Block::default());
+        self.blocks.len() - 1
+    }
+
+    pub fn type_of(&self, v: V) -> Ty {
+        match v {
+            V::Global(i) => self.globals[i as usize].ptr,
+            V::Const(i) => self.consts[i as usize].0,
+            V::Inst(i) => self.insts[i as usize].ty,
+            V::Func(i) => {
+                let t = self.funcs[i as usize].ty;
+                *self
+                    .type_ids
+                    .get(&TypeDef::Ptr(t, 0))
+                    .map(|t| Ty(*t))
+                    .as_ref()
+                    .expect("function pointer type")
+            }
+        }
+    }
+
+    fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let i = self.insts.len() as u32;
+        self.insts.push(Inst { ty, op });
+        // Terminators are kept apart, so a block can still grow at its end.
+        self.blocks[block].body.push(i);
+        V::Inst(i)
+    }
+
+    pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
+        let ty = self.type_of(a);
+        self.push(block, ty, Op::Bin(op, a, b))
+    }
+    pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
+        self.push(block, to, Op::Cast(op, v))
+    }
+    pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
+        let t = self.int(1);
+        self.push(block, t, Op::Cmp(pred, a, b))
+    }
+    pub fn select(&mut self, block: usize, c: V, t: V, f: V) -> V {
+        let ty = self.type_of(t);
+        self.push(block, ty, Op::Select(c, t, f))
+    }
+    pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
+        let ty = match &self.types[self.type_of(agg).0 as usize] {
+            TypeDef::Struct(_, f) => f[index as usize],
+            TypeDef::Array(_, t) => *t,
+            t => panic!("extractvalue from {t:?}"),
+        };
+        self.push(block, ty, Op::Extract(agg, index))
+    }
+    pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
+        let V::Func(i) = f else {
+            panic!("call of a non-function")
+        };
+        let TypeDef::Func(ret, _) = self.types[self.funcs[i as usize].ty.0 as usize] else {
+            unreachable!()
+        };
+        self.push(block, ret, Op::Call(i, args))
+    }
+    /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
+    pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+        let i = self.insts.len() as u32;
+        self.insts.push(Inst {
+            ty,
+            op: Op::Phi(Vec::new()),
+        });
+        self.blocks[block].phis.push(i);
+        V::Inst(i)
+    }
+    /// The address of element `index` of the array `ptr` points to.
+    pub fn element(&mut self, block: usize, ptr: V, index: V) -> V {
+        let TypeDef::Ptr(arr, space) = self.types[self.type_of(ptr).0 as usize] else {
+            panic!("element of a non-pointer")
+        };
+        let TypeDef::Array(_, elem) = self.types[arr.0 as usize] else {
+            panic!("element of a non-array")
+        };
+        let ty = self.ptr_in(elem, space);
+        let zero = self.i32(0);
+        self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
+    }
+    pub fn load(&mut self, block: usize, ptr: V) -> V {
+        let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
+            panic!("load from a non-pointer")
+        };
+        self.push(block, ty, Op::Load(ptr))
+    }
+    pub fn store(&mut self, block: usize, ptr: V, value: V) {
+        let void = self.void();
+        self.push(block, void, Op::Store(ptr, value));
+    }
+    pub fn atomic(&mut self, block: usize, op: Rmw, ptr: V, value: V) -> V {
+        let ty = self.type_of(value);
+        self.push(block, ty, Op::AtomicRmw(op, ptr, value))
+    }
+    /// The old value of a compare-exchange.
+    pub fn cmpxchg(&mut self, block: usize, ptr: V, expected: V, new: V) -> V {
+        let (i32t, i1) = (self.type_of(new), self.int(1));
+        let pair = self.ty(TypeDef::Struct(None, vec![i32t, i1]));
+        let r = self.push(block, pair, Op::CmpXchg(ptr, expected, new));
+        self.extract(block, r, 0)
+    }
+
+    pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+        let V::Inst(i) = phi else { panic!() };
+        self.insts[i as usize].op = Op::Phi(incoming);
+    }
+    pub fn terminate(&mut self, block: usize, t: Term) {
+        self.blocks[block].term = Some(t);
+    }
+
+    pub fn md_str(&mut self, s: &str) -> Md {
+        self.mds.push(MdDef::Str(s.into()));
+        Md(self.mds.len() as u32 - 1)
+    }
+    pub fn md_value(&mut self, v: V) -> Md {
+        let ty = self.type_of(v);
+        self.mds.push(MdDef::Value(ty, v));
+        Md(self.mds.len() as u32 - 1)
+    }
+    pub fn md_node(&mut self, ops: Vec<Option<Md>>) -> Md {
+        self.mds.push(MdDef::Node(ops));
+        Md(self.mds.len() as u32 - 1)
+    }
+    pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
+        self.named.push((name.into(), nodes));
+    }
+
+    /// Reachable blocks from entry (`0`) in reverse postorder, and a mask of
+    /// reachable block indices.
+    fn reachable_rpo(&self) -> (Vec<usize>, Vec<bool>) {
+        let mut seen = vec![false; self.blocks.len()];
+        if self.blocks.is_empty() {
+            return (Vec::new(), seen);
+        }
+        let mut post = Vec::with_capacity(self.blocks.len());
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            let (succs, len) = succs_of(self.blocks[b].term);
+            if k < len {
+                let s = succs[k];
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        (post, seen)
+    }
+
+    /// Whether `inst` has an observable side effect of its own even when
+    /// nothing reads its result.
+    fn is_root(&self, inst: &Inst) -> bool {
+        match &inst.op {
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+            Op::Call(f, _) => {
+                let func = &self.funcs[*f as usize];
+                self.is_void(inst.ty)
+                    || match func.attr {
+                        None | Some(Attr::NoDuplicate) => true,
+                        Some(Attr::ReadNone | Attr::ReadOnly) => false,
+                        Some(Attr::NoUnwind) => func.name.starts_with("dx.op.atomic"),
+                    }
+            }
+            Op::Bin(..)
+            | Op::Cast(..)
+            | Op::Cmp(..)
+            | Op::Select(..)
+            | Op::Extract(..)
+            | Op::Phi(..)
+            | Op::Gep(..)
+            | Op::Load(..) => false,
+        }
+    }
+
+    /// Backward liveness over `self.insts`: seeds side-effecting instructions
+    /// and branch conditions in reachable blocks (`rpo`), then walks operand
+    /// chains once via a worklist.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> Vec<bool> {
+        let (rpo, seen) = self.reachable_rpo();
+        self.live_in(&rpo, &seen)
+    }
+
+    fn live_in(&self, rpo: &[usize], seen: &[bool]) -> Vec<bool> {
+        let mut live = vec![false; self.insts.len()];
+        let mut work = Vec::new();
+        let mark = |live: &mut [bool], work: &mut Vec<usize>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                work.push(i as usize);
+            }
+        };
+        for &b in rpo {
+            let blk = &self.blocks[b];
+            for &i in &blk.body {
+                if self.is_root(&self.insts[i as usize]) {
+                    mark(&mut live, &mut work, V::Inst(i));
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = blk.term {
+                mark(&mut live, &mut work, c);
+            }
+        }
+        for m in &self.mds {
+            if let MdDef::Value(_, v) = m {
+                mark(&mut live, &mut work, *v);
+            }
+        }
+        while let Some(i) = work.pop() {
+            match &self.insts[i].op {
+                Op::Phi(inc) => {
+                    for &(v, pred) in inc {
+                        if seen[pred] {
+                            mark(&mut live, &mut work, v);
+                        }
+                    }
+                }
+                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
+            }
+        }
+        live
+    }
+
+    /// Prunes instruction-driven `ShaderFlags` bits (`TYPED_UAV_LOADS`,
+    /// `WAVE_OPS`, `INT64`, `RESOURCE_HEAP`, `SAMPLER_HEAP`) to those used by
+    /// instructions that survive dead-code elimination, so declared flags
+    /// always match what `dxil.dll` observes in `main`.
+    pub(crate) fn active_flags(&self, declared: u64) -> u64 {
+        use super::shader::flags;
+        const INSTRUCTION_FLAGS: u64 = flags::TYPED_UAV_LOADS
+            | flags::WAVE_OPS
+            | flags::INT64
+            | flags::RESOURCE_HEAP
+            | flags::SAMPLER_HEAP;
+        if declared & INSTRUCTION_FLAGS == 0 {
+            return declared;
+        }
+        let (rpo, seen) = self.reachable_rpo();
+        let live = self.live_in(&rpo, &seen);
+        let mut actual = declared & !INSTRUCTION_FLAGS;
+        let is_i64 = |v_ty: Ty| self.types[v_ty.0 as usize] == TypeDef::Int(64);
+        for &b in &rpo {
+            let blk = &self.blocks[b];
+            for &idx in blk.phis.iter().chain(&blk.body) {
+                let i = idx as usize;
+                if !live[i] {
+                    continue;
+                }
+                let inst = &self.insts[i];
+                if declared & flags::INT64 != 0 && is_i64(inst.ty) {
+                    actual |= flags::INT64;
+                }
+                if declared & flags::INT64 != 0 && actual & flags::INT64 == 0 {
+                    for_each_operand(&inst.op, |v| {
+                        if is_i64(self.type_of(v)) {
+                            actual |= flags::INT64;
+                        }
+                    });
+                }
+                if let Op::Call(f, args) = &inst.op {
+                    let name = self.funcs[*f as usize].name.as_str();
+                    if name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad") {
+                        actual |= flags::WAVE_OPS;
+                    } else if name == "dx.op.createHandleFromHeap" {
+                        let sampler = matches!(
+                            args.get(2),
+                            Some(&V::Const(c)) if self.consts[c as usize].1 != Const::Int(0)
+                        );
+                        actual |= if sampler {
+                            flags::SAMPLER_HEAP
+                        } else {
+                            flags::RESOURCE_HEAP
+                        };
+                    } else if declared & flags::TYPED_UAV_LOADS != 0
+                        && (name.starts_with("dx.op.bufferLoad.")
+                            || name.starts_with("dx.op.textureLoad."))
+                        && let Some(&V::Inst(hi)) = args.get(1)
+                        && let Op::Call(_, hargs) = &self.insts[hi as usize].op
+                        && let Some(&V::Const(agg)) = hargs.get(2)
+                        && let Const::Aggregate(fields) = &self.consts[agg as usize].1
+                        && let Some(&p0) = fields.first()
+                        && let Const::Int(v0) = self.consts[p0 as usize].1
+                        && (v0 as u32) & 0x1000 != 0
+                    {
+                        actual |= flags::TYPED_UAV_LOADS;
+                    }
+                }
+            }
+        }
+        actual & declared
+    }
+
+    /// The module as bitcode.
+    pub fn write(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.bytes(b"BC\xC0\xDE");
+        w.enter(MODULE_BLOCK, 3);
+        w.record(1, &[1]); // VERSION: relative value ids
+
+        // Attribute groups 1-4 and one list per group.
+        w.enter(PARAMATTR_GROUP_BLOCK, 3);
+        for (id, kinds) in [
+            (1, &[18u64, 20][..]),
+            (2, &[18]),
+            (3, &[18, 21]),
+            (4, &[12, 18]),
+        ] {
+            let mut r = vec![id, 0xFFFF_FFFF];
+            for &k in kinds {
+                r.extend([0, k]);
+            }
+            w.record(3, &r);
+        }
+        w.exit();
+        w.enter(PARAMATTR_BLOCK, 3);
+        for id in 1..=4 {
+            w.record(2, &[id]);
+        }
+        w.exit();
+
+        w.enter(TYPE_BLOCK, 4);
+        w.record(1, &[self.types.len() as u64]);
+        for t in &self.types {
+            match t {
+                TypeDef::Void => w.record(2, &[]),
+                TypeDef::Float => w.record(3, &[]),
+                TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
+                TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
+                TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
+                TypeDef::Struct(name, fields) => {
+                    let mut r = vec![0];
+                    r.extend(fields.iter().map(|f| u64::from(f.0)));
+                    match name {
+                        Some(n) => {
+                            w.record(19, &chars(n));
+                            w.record(20, &r);
+                        }
+                        None => w.record(18, &r),
+                    }
+                }
+                TypeDef::Func(ret, params) => {
+                    let mut r = vec![0, u64::from(ret.0)];
+                    r.extend(params.iter().map(|p| u64::from(p.0)));
+                    w.record(21, &r);
+                }
+            }
+        }
+        w.exit();
+
+        w.record(2, &chars("dxil-ms-dx"));
+        w.record(
+            3,
+            &chars(
+                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
+            ),
+        );
+
+        // Blocks are laid out in reverse postorder, so every block follows
+        // its forward predecessors (drivers take a branch to an earlier
+        // block for a loop's back edge). Backward dead-code elimination
+        // drops phis, pure instructions, and unused `dx.op` declarations.
+        let (post, seen) = self.reachable_rpo();
+        let live = self.live_in(&post, &seen);
+
+        let mut used_func = vec![false; self.funcs.len()];
+        for (i, f) in self.funcs.iter().enumerate() {
+            if f.body {
+                used_func[i] = true;
+            }
+        }
+        for m in &self.mds {
+            if let MdDef::Value(_, V::Func(i)) = m {
+                used_func[*i as usize] = true;
+            }
+        }
+        for &b in &post {
+            for &i in &self.blocks[b].body {
+                if live[i as usize]
+                    && let Op::Call(f, _) = &self.insts[i as usize].op
+                {
+                    used_func[*f as usize] = true;
+                }
+            }
+        }
+        let mut func_remap = vec![u32::MAX; self.funcs.len()];
+        let mut kept_funcs = Vec::with_capacity(self.funcs.len());
+        for (i, _) in self.funcs.iter().enumerate().filter(|&(i, _)| used_func[i]) {
+            func_remap[i] = kept_funcs.len() as u32;
+            kept_funcs.push(i);
+        }
+
+        let first_const = (self.globals.len() + kept_funcs.len()) as u64;
+        for g in &self.globals {
+            // [type, address space << 2 | explicit type | constant, init id
+            // + 1, linkage (external 0, internal 3), log2 alignment + 1,
+            // section]
+            let (constant, init, linkage) = match g.init {
+                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                None => (0, 0, 0),
+            };
+            w.record(
+                7,
+                &[
+                    u64::from(g.ty.0),
+                    u64::from(g.space) << 2 | 2 | constant,
+                    init,
+                    linkage,
+                    3,
+                    0,
+                ],
+            );
+        }
+        for &fi in &kept_funcs {
+            let f = &self.funcs[fi];
+            // [type, cc, isproto, linkage, paramattr, align, section,
+            // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
+            let attr = f.attr.map_or(0, |a| a as u64);
+            w.record(
+                8,
+                &[
+                    u64::from(f.ty.0),
+                    0,
+                    u64::from(!f.body),
+                    0,
+                    attr,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+        }
+
+        // Value ids: globals, functions, constants, instructions.
+        let globals = self.globals.len() as u32;
+        let funcs = globals + kept_funcs.len() as u32;
+        let const_id = |i: u32| u64::from(funcs + i);
+        w.enter(CONSTANTS_BLOCK, 4);
+        let mut current = None;
+        for (ty, c) in &self.consts {
+            if current != Some(*ty) {
+                w.record(1, &[u64::from(ty.0)]);
+                current = Some(*ty);
+            }
+            match c {
+                Const::Undef => w.record(3, &[]),
+                Const::Int(v) => w.record(4, &[signed(*v)]),
+                Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
+                Const::Aggregate(ids) => {
+                    let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
+                    w.record(7, &r);
+                }
+            }
+        }
+        w.exit();
+
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            let (succs, len) = succs_of(self.blocks[b].term);
+            for &s in &succs[..len] {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            let empty = blk.phis.iter().chain(&blk.body).all(|&i| !live[i as usize]);
+            if let (Some(Term::Br(h)), true, [p]) = (blk.term, empty, &preds[b][..])
+                && pos[h] < pos[b]
+                && pos[*p] < pos[b]
+                && fold[*p].is_none()
+                && fold[h].is_none()
+            {
+                let (ps, plen) = succs_of(self.blocks[*p].term);
+                if !ps[..plen].contains(&h) {
+                    fold[b] = Some((*p, h));
+                }
+            }
+        }
+        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in layout.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // Branch targets and phi blocks through folded latches.
+        let target = |t: usize| fold[t].map_or(pos[t], |(_, h)| pos[h]);
+        let from = |b: usize| fold[b].map_or(pos[b], |(p, _)| pos[p]);
+
+        // Instruction value ids, in layout order.
+        let base = funcs + self.consts.len() as u32;
+        let mut ids = vec![u32::MAX; self.insts.len()];
+        let mut next = base;
+        for b in layout.iter().map(|&b| &self.blocks[b]) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
+                if !self.is_void(self.insts[i as usize].ty) {
+                    ids[i as usize] = next;
+                    next += 1;
+                }
+            }
+        }
+        let abs = |v: V| -> u32 {
+            match v {
+                V::Global(i) => i,
+                V::Func(i) => {
+                    let mapped = func_remap[i as usize];
+                    assert_ne!(mapped, u32::MAX, "use of an unreferenced function");
+                    globals + mapped
+                }
+                V::Const(i) => funcs + i,
+                V::Inst(i) => {
+                    let id = ids[i as usize];
+                    assert_ne!(id, u32::MAX, "use of a void or dead value");
+                    id
+                }
+            }
+        };
+
+        w.enter(METADATA_BLOCK, 3);
+        for m in &self.mds {
+            match m {
+                MdDef::Str(s) => w.record(1, &chars(s)),
+                MdDef::Value(ty, v) => w.record(2, &[u64::from(ty.0), u64::from(abs(*v))]),
+                MdDef::Node(ops) => {
+                    let r: Vec<u64> = ops
+                        .iter()
+                        .map(|o| o.map_or(0, |m| u64::from(m.0) + 1))
+                        .collect();
+                    w.record(3, &r);
+                }
+            }
+        }
+        for (name, nodes) in &self.named {
+            w.record(4, &chars(name));
+            let r: Vec<u64> = nodes.iter().map(|m| u64::from(m.0)).collect();
+            w.record(10, &r);
+        }
+        w.exit();
+        // The metadata kinds an LLVM 3.7 module declares, as DXC writes them.
+        w.enter(METADATA_BLOCK, 3);
+        for (id, kind) in [
+            "dbg",
+            "tbaa",
+            "prof",
+            "fpmath",
+            "range",
+            "tbaa.struct",
+            "invariant.load",
+            "alias.scope",
+            "noalias",
+            "nontemporal",
+            "llvm.mem.parallel_loop_access",
+            "nonnull",
+            "dereferenceable",
+            "dereferenceable_or_null",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = vec![id as u64];
+            r.extend(chars(kind));
+            w.record(6, &r);
+        }
+        w.exit();
+
+        w.enter(VALUE_SYMTAB_BLOCK, 4);
+        let names = self
+            .globals
+            .iter()
+            .map(|g| &g.name)
+            .chain(kept_funcs.iter().map(|&fi| &self.funcs[fi].name));
+        for (i, name) in names.enumerate() {
+            let mut r = vec![i as u64];
+            r.extend(chars(name));
+            w.record(1, &r);
+        }
+        w.exit();
+
+        w.enter(FUNCTION_BLOCK, 4);
+        w.record(1, &[layout.len() as u64]);
+        let mut inst_id = base;
+        let mut rec = Vec::with_capacity(16);
+        for b in layout.iter().map(|&b| &self.blocks[b]) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
+                let inst = &self.insts[i as usize];
+                let rel = |v: V| {
+                    let a = abs(v);
+                    assert!(a < inst_id, "forward reference outside a phi");
+                    u64::from(inst_id - a)
+                };
+                match &inst.op {
+                    Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
+                    Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
+                    Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
+                    Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
+                    Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
+                    Op::Call(f, args) => {
+                        rec.clear();
+                        rec.extend([
+                            0,
+                            1 << 15,
+                            u64::from(self.funcs[*f as usize].ty.0),
+                            rel(V::Func(*f)),
+                        ]);
+                        rec.extend(args.iter().map(|&a| rel(a)));
+                        w.record(34, &rec);
+                    }
+                    Op::Phi(incoming) => {
+                        rec.clear();
+                        rec.push(u64::from(inst.ty.0));
+                        for &(v, pred) in incoming {
+                            if seen[pred] {
+                                rec.push(signed(i64::from(inst_id) - i64::from(abs(v))));
+                                rec.push(from(pred));
+                            }
+                        }
+                        w.record(16, &rec);
+                    }
+                    Op::Gep(ty, p, idx) => {
+                        rec.clear();
+                        rec.extend([0, u64::from(ty.0), rel(*p)]);
+                        rec.extend(idx.iter().map(|&i| rel(i)));
+                        w.record(43, &rec);
+                    }
+                    // Alignment 4 (log2 + 1), not volatile.
+                    Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
+                    Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
+                    // Sequentially consistent, across threads.
+                    Op::AtomicRmw(op, p, v) => {
+                        w.record(38, &[rel(*p), rel(*v), *op as u64, 0, 6, 1])
+                    }
+                    Op::CmpXchg(p, c, n) => {
+                        w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
+                    }
+                }
+                if !self.is_void(inst.ty) {
+                    inst_id += 1;
+                }
+            }
+            match b.term.expect("unterminated block") {
+                Term::Ret => w.record(10, &[]),
+                Term::Br(t) => w.record(11, &[target(t)]),
+                Term::CondBr(c, t, f) => {
+                    let a = abs(c);
+                    assert!(a < inst_id);
+                    w.record(11, &[target(t), target(f), u64::from(inst_id - a)]);
+                }
+            }
+        }
+        w.exit();
+        w.exit();
+        w.finish()
+    }
+}
+
+fn succs_of(term: Option<Term>) -> ([usize; 2], usize) {
+    match term {
+        Some(Term::Br(t)) => ([t, 0], 1),
+        Some(Term::CondBr(_, t, f)) => ([t, f], 2),
+        _ => ([0, 0], 0),
+    }
+}
+
+fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            f(*a);
+            f(*b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            f(*a);
+            f(*b);
+            f(*c);
+        }
+        Op::Call(_, args) => args.iter().copied().for_each(f),
+        Op::Phi(inc) => inc.iter().for_each(|&(v, _)| f(v)),
+        Op::Gep(_, p, idx) => {
+            f(*p);
+            idx.iter().copied().for_each(f);
+        }
+    }
+}
+
+const MODULE_BLOCK: u64 = 8;
+const PARAMATTR_BLOCK: u64 = 9;
+const PARAMATTR_GROUP_BLOCK: u64 = 10;
+const CONSTANTS_BLOCK: u64 = 11;
+const FUNCTION_BLOCK: u64 = 12;
+const VALUE_SYMTAB_BLOCK: u64 = 14;
+const METADATA_BLOCK: u64 = 15;
+const TYPE_BLOCK: u64 = 17;
+
+fn chars(s: &str) -> Vec<u64> {
+    s.bytes().map(u64::from).collect()
+}
+
+/// LLVM's signed VBR operand: magnitude shifted left, sign in bit 0.
+fn signed(v: i64) -> u64 {
+    if v >= 0 {
+        (v as u64) << 1
+    } else {
+        (v.unsigned_abs() << 1) | 1
+    }
+}
+
+/// The bitstream: little-endian 32-bit words filled from bit 0.
+#[derive(Default)]
+struct Writer {
+    words: Vec<u32>,
+    cur: u64,
+    bits: u32,
+    /// Per open block: abbreviation width, index of its length word.
+    stack: Vec<(u32, usize)>,
+}
+
+impl Writer {
+    fn width(&self) -> u32 {
+        self.stack.last().map_or(2, |b| b.0)
+    }
+
+    fn emit(&mut self, v: u64, width: u32) {
+        debug_assert!(width == 64 || v >> width == 0);
+        self.cur |= v << self.bits;
+        self.bits += width;
+        while self.bits >= 32 {
+            self.words.push(self.cur as u32);
+            self.cur >>= 32;
+            self.bits -= 32;
+        }
+    }
+
+    fn vbr(&mut self, mut v: u64, width: u32) {
+        let hi = 1u64 << (width - 1);
+        while v >= hi {
+            self.emit(v & (hi - 1) | hi, width);
+            v >>= width - 1;
+        }
+        self.emit(v, width);
+    }
+
+    fn align(&mut self) {
+        if self.bits > 0 {
+            self.words.push(self.cur as u32);
+            self.cur = 0;
+            self.bits = 0;
+        }
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        for &x in b {
+            self.emit(u64::from(x), 8);
+        }
+    }
+
+    fn enter(&mut self, id: u64, width: u32) {
+        self.emit(1, self.width()); // ENTER_SUBBLOCK
+        self.vbr(id, 8);
+        self.vbr(u64::from(width), 4);
+        self.align();
+        self.words.push(0);
+        self.stack.push((width, self.words.len()));
+    }
+
+    fn exit(&mut self) {
+        self.emit(0, self.width()); // END_BLOCK
+        self.align();
+        let (_, start) = self.stack.pop().expect("open block");
+        self.words[start - 1] = (self.words.len() - start) as u32;
+    }
+
+    /// An unabbreviated record.
+    fn record(&mut self, code: u64, ops: &[u64]) {
+        self.emit(3, self.width());
+        self.vbr(code, 6);
+        self.vbr(ops.len() as u64, 6);
+        for &o in ops {
+            self.vbr(o, 6);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.align();
+        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vbr_and_blocks() {
+        let mut w = Writer::default();
+        w.vbr(5, 6);
+        w.vbr(100, 6); // two chunks: 100 = 0b1100100 -> 0b100100 | 32, then 3
+        assert_eq!(w.cur, 5 | (0b10_0100 << 6) | (3 << 12));
+        let mut w = Writer::default();
+        w.enter(8, 3);
+        w.record(1, &[1]);
+        w.exit();
+        let bytes = w.finish();
+        // header word, length word, one record word, end word.
+        assert_eq!(bytes.len() % 4, 0);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
+        assert_eq!(signed(-3), 7);
+        assert_eq!(signed(2), 4);
+    }
+
+    #[test]
+    fn dead_instructions_and_unused_declarations_are_eliminated() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let arr_ty = m.array(4, i32t);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        let _ = m.function("main", main_ty, None, true);
+        let lds = m.global("lds", arr_ty, 3);
+
+        let pure_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(pure_ty);
+        let dead_op = m.function("dx.op.unary.i32", pure_ty, Some(Attr::ReadNone), false);
+        let dead_wave = m.function(
+            "dx.op.waveGetLaneIndex",
+            pure_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+        let live_op = m.function("dx.op.unaryBits.i32", pure_ty, Some(Attr::ReadNone), false);
+
+        let entry = m.new_block();
+        let loop_hdr = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+        let unreachable_blk = m.new_block();
+
+        let (k0, k1, k2, k7) = (m.i32(0), m.i32(1), m.i32(2), m.i32(7));
+        // Dead ALU, dead load, dead pure & wave dx.op calls.
+        let dead_add = m.bin(entry, Bin::Add, k1, k2);
+        let dead_ptr = m.element(entry, lds, dead_add);
+        let dead_ld = m.load(entry, dead_ptr);
+        let dead_call = m.call(entry, dead_op, vec![k0, dead_ld]);
+        let dead_w = m.call(entry, dead_wave, vec![k0, dead_call]);
+        let _ = m.cmp(entry, pred::NE, dead_w, k0);
+
+        // Live operand chain feeding a branch condition and a store.
+        let live_call = m.call(entry, live_op, vec![k1, k7]);
+        m.terminate(entry, Term::Br(loop_hdr));
+
+        // Cyclic dead phis vs a live phi.
+        let cyc_a = m.phi(loop_hdr, i32t);
+        let cyc_b = m.phi(loop_hdr, i32t);
+        let live_phi = m.phi(loop_hdr, i32t);
+        let next_val = m.bin(loop_hdr, Bin::Add, live_phi, k1);
+        let cond = m.cmp(loop_hdr, pred::IULT, next_val, k7);
+        m.terminate(loop_hdr, Term::CondBr(cond, latch, exit));
+
+        // Latch has only a dead instruction -> becomes empty after DCE and folds!
+        let _dead_in_latch = m.bin(latch, Bin::Xor, next_val, k2);
+        m.terminate(latch, Term::Br(loop_hdr));
+
+        m.set_phi(cyc_a, vec![(k1, entry), (cyc_b, latch)]);
+        m.set_phi(cyc_b, vec![(k2, entry), (cyc_a, latch)]);
+        m.set_phi(live_phi, vec![(live_call, entry), (next_val, latch)]);
+
+        let out_ptr = m.element(exit, lds, k0);
+        m.store(exit, out_ptr, next_val);
+        m.terminate(exit, Term::Ret);
+
+        // Unreachable block with a store must not keep `dead_add` alive.
+        let unreach_ptr = m.element(unreachable_blk, lds, dead_add);
+        m.store(unreachable_blk, unreach_ptr, dead_add);
+        m.terminate(unreachable_blk, Term::Ret);
+
+        let idx = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(!live[idx(dead_add)]);
+        assert!(!live[idx(dead_ptr)]);
+        assert!(!live[idx(dead_ld)]);
+        assert!(!live[idx(dead_call)]);
+        assert!(!live[idx(dead_w)]);
+        assert!(!live[idx(cyc_a)] && !live[idx(cyc_b)]);
+        assert!(
+            live[idx(live_call)] && live[idx(live_phi)] && live[idx(next_val)] && live[idx(cond)]
+        );
+
+        let bytes = m.write();
+
+        // Build the minimal equivalent module (no dead instructions, no unused
+        // declarations, latch already folded, no unreachable block): the
+        // written bitcode must match byte-for-byte.
+        let mut clean = Module::default();
+        let void = clean.void();
+        let i32t = clean.int(32);
+        let arr_ty = clean.array(4, i32t);
+        let main_ty = clean.func_ty(void, vec![]);
+        clean.ptr(main_ty);
+        let _ = clean.function("main", main_ty, None, true);
+        let lds = clean.global("lds", arr_ty, 3);
+        let pure_ty = clean.func_ty(i32t, vec![i32t, i32t]);
+        clean.ptr(pure_ty);
+        let live_op = clean.function("dx.op.unaryBits.i32", pure_ty, Some(Attr::ReadNone), false);
+        let entry = clean.new_block();
+        let loop_hdr = clean.new_block();
+        let exit = clean.new_block();
+        let (k0, k1, _k2, k7) = (clean.i32(0), clean.i32(1), clean.i32(2), clean.i32(7));
+        let _ = clean.element(entry, lds, k0); // registers ptr_in(i32, 3) in same type order
+        clean.blocks[entry].body.clear();
+        clean.insts.clear();
+        let live_call = clean.call(entry, live_op, vec![k1, k7]);
+        clean.terminate(entry, Term::Br(loop_hdr));
+        let live_phi = clean.phi(loop_hdr, i32t);
+        let next_val = clean.bin(loop_hdr, Bin::Add, live_phi, k1);
+        let cond = clean.cmp(loop_hdr, pred::IULT, next_val, k7);
+        clean.terminate(loop_hdr, Term::CondBr(cond, loop_hdr, exit));
+        clean.set_phi(live_phi, vec![(live_call, entry), (next_val, loop_hdr)]);
+        let out_ptr = clean.element(exit, lds, k0);
+        clean.store(exit, out_ptr, next_val);
+        clean.terminate(exit, Term::Ret);
+
+        let clean_bytes = clean.write();
+        assert_eq!(bytes, clean_bytes);
+    }
+
+    #[test]
+    fn side_effecting_atomics_with_unused_results_stay_live() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let arr_ty = m.array(4, i32t);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        let _ = m.function("main", main_ty, None, true);
+        let lds = m.global("lds", arr_ty, 3);
+
+        let atomic_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(atomic_ty);
+        let uav_atomic = m.function(
+            "dx.op.atomicBinOp.i32",
+            atomic_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+
+        let b = m.new_block();
+        let (k0, k3, k5) = (m.i32(0), m.i32(3), m.i32(5));
+        let arg_a = m.bin(b, Bin::Add, k0, k3);
+        let _unused_uav = m.call(b, uav_atomic, vec![k0, arg_a]);
+
+        let arg_b = m.bin(b, Bin::Mul, k3, k5);
+        let ptr = m.element(b, lds, k0);
+        let _unused_rmw = m.atomic(b, Rmw::Add, ptr, arg_b);
+
+        let arg_c = m.bin(b, Bin::Sub, k5, k3);
+        let _unused_cas = m.cmpxchg(b, ptr, k0, arg_c);
+        m.terminate(b, Term::Ret);
+
+        let idx = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(live[idx(arg_a)], "dx.op.atomicBinOp operand must stay live");
+        assert!(live[idx(arg_b)], "AtomicRmw operand must stay live");
+        assert!(live[idx(arg_c)], "CmpXchg operand must stay live");
+        // Notice the `extractvalue` wrapper inside `cmpxchg()` is unused and eliminated!
+        assert!(!live[idx(_unused_cas)]);
+        let _ = m.write();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn post_dce_shader_flags_validate_with_dxil() {
+        use super::super::container::SigElement;
+        use super::super::shader::{Shader, flags};
+        use super::super::validator::Validator;
+        use crate::dxbc::{Container, FourCC};
+
+        let mut s = Shader::new(true);
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        });
+        let b = s.entry;
+
+        // Emit dead instructions that originally set INT64, WAVE_OPS,
+        // RESOURCE_HEAP, SAMPLER_HEAP, and TYPED_UAV_LOADS.
+        let i64t = s.m.int(64);
+        let k64 = s.m.int_const(i64t, 99);
+        let k7 = s.m.i32(7);
+        let zext = s.m.cast(b, Cast::ZExt, k7, i64t);
+        let sum64 = s.m.bin(b, Bin::Add, zext, k64);
+        let _dead_i64 = s.m.cast(b, Cast::Trunc, sum64, s.t.i32);
+        s.flags |= flags::INT64;
+
+        let _dead_wave = s.op(b, "waveGetLaneIndex", Attr::ReadNone, s.t.i32, 111, &[]);
+        s.flags |= flags::WAVE_OPS;
+        let _dead_root_srv = s.root_srv_handle(0);
+
+        let idx0 = s.m.i32(0);
+        let uav_h = s.heap_handle(b, idx0, false, false, (10 | 0x1000, 0x409));
+        let _samp_h = s.heap_handle(b, idx0, true, false, (14, 0));
+        let iu = s.m.undef(s.t.i32);
+        let _dead_uav_ld = s.op(
+            b,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            68,
+            &[uav_h, idx0, iu],
+        );
+        s.flags |= flags::TYPED_UAV_LOADS;
+
+        // Only constant SV_Target stores are live.
+        for col in 0..4u8 {
+            let args = [
+                s.m.i32(0),
+                s.m.i32(0),
+                s.m.i8(col),
+                s.m.f32(1.0f32.to_bits()),
+            ];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(b, Term::Ret);
+
+        let container = s.finish();
+        let parsed = Container::parse(&container).unwrap();
+        let sfi0 = u64::from_le_bytes(parsed.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_eq!(sfi0, 0, "dead feature flags must be pruned after DCE");
+
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            let mut copy = container.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy)
+                .expect("DXIL validation failed after DCE");
+            assert_eq!(copy[4..20], ours[..]);
+        }
+    }
+}

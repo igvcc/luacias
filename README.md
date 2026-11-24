@@ -1,6 +1,7 @@
 # Luacias 🌴
 
 [![Discord Server](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6r4ngXfsab)
+[![Latest Release](https://img.shields.io/badge/Release-v0.1.0--preview-brightgreen?style=for-the-badge&logo=github)](https://github.com/igvcc/luacias/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/igvcc/luacias)
 [![DirectX](https://img.shields.io/badge/Graphics-DirectX%2012%20Ultimate%20(SM%206.6)-black?style=for-the-badge&logo=directx)](https://github.com/igvcc/luacias)
 [![Status](https://img.shields.io/badge/Status-In%20Active%20Research-orange?style=for-the-badge)](https://discord.gg/6r4ngXfsab)
@@ -78,13 +79,35 @@ To run and experiment with the translation layer, modern PC hardware is required
 
 ## 🚀 Running & Quick Start
 
-1. **Verify your game assets:** Ensure your developer / Scarlett executable (`game_scarlett_master.exe`) and package data are placed on a fast NVMe drive.
-2. **Environment Variables:**
-   ```cmd
-   set VICTORY_SHADER_LOOP_LIMIT=4096
-   set VICTORY_NO_INDIRECT=0
-   ```
-3. **Launch:** Run through the compatibility launcher or executable.
+### Option A: Pre-built Binary
+1. Download the latest release package from the [Releases](https://github.com/igvcc/luacias/releases) page.
+2. Extract the archive and copy `scripts/launch_gta6.cmd` alongside `victory.exe`.
+3. Run `launch_gta6.cmd` and specify the path to `game_scarlett_master.exe`.
+
+### Option B: Building from Source
+Ensure you have the latest **Rust (1.80+)** and **Visual Studio 2022 C++ build tools**:
+```cmd
+git clone https://github.com/igvcc/luacias.git
+cd luacias
+cargo build --release
+```
+The compiled binary will be generated in `target\release\victory.exe`.
+
+---
+
+## ⚙️ Configuration & Environment
+
+Recommended runtime flags for stability:
+```cmd
+:: Enable dynamic loop limits against driver TDR timeouts
+set VICTORY_SHADER_LOOP_LIMIT=4096
+
+:: Enable pipeline journal logging
+set VICTORY_PIPELINE_JOURNAL=1
+
+:: Direct execution without indirect draw drops (for tested hardware)
+set VICTORY_NO_INDIRECT=0
+```
 
 ---
 
