@@ -1,7 +1,8 @@
 # Luacias 🌴
 
 [![Discord Server](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6r4ngXfsab)
-[![Latest Release](https://img.shields.io/badge/Release-v0.1.0--preview-brightgreen?style=for-the-badge&logo=github)](https://github.com/igvcc/luacias/releases)
+[![Latest Release](https://img.shields.io/badge/Release-v0.2.0--preview-brightgreen?style=for-the-badge&logo=github)](https://github.com/igvcc/luacias/releases)
+[![Changelog](https://img.shields.io/badge/Changelog-View-blue?style=for-the-badge)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/igvcc/luacias)
 [![DirectX](https://img.shields.io/badge/Graphics-DirectX%2012%20Ultimate%20(SM%206.6)-black?style=for-the-badge&logo=directx)](https://github.com/igvcc/luacias)
 [![Status](https://img.shields.io/badge/Status-In%20Active%20Research-orange?style=for-the-badge)](https://discord.gg/6r4ngXfsab)

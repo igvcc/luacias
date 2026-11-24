@@ -1104,6 +1104,63 @@ fn operand_const_lane(op: &Operand) -> Option<u32> {
     }
 }
 
+/// Dwords a scalar load reads, by the suffix of its name after
+/// `s_load_dword` or `s_buffer_load_dword`.
+fn smem_dwords(suffix: &str) -> Option<u32> {
+    match suffix {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
+        _ => None,
+    }
+}
+
+/// A byte or halfword LDS access: `ds_read_{u,i}{8,16}[_d16[_hi]]` and
+/// `ds_write_b{8,16}[_d16_hi]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubDword {
+    write: bool,
+    bits: u32,
+    /// Reads: sign-extended.
+    signed: bool,
+    /// Reads: the result is 16 bits wide and goes into one half of the VGPR,
+    /// the other half kept (`Some(true)`: the high half). Writes: the data
+    /// comes from the high half (`Some(true)`).
+    d16: Option<bool>,
+}
+
+impl SubDword {
+    fn of(name: &str) -> Option<Self> {
+        let (write, rest) = match name.strip_prefix("ds_read_") {
+            Some(r) => (false, r),
+            None => (true, name.strip_prefix("ds_write_")?),
+        };
+        let (ty, d16) = match rest.split_once("_d16") {
+            None => (rest, None),
+            Some((t, "")) if !write => (t, Some(false)),
+            Some((t, "_hi")) => (t, Some(true)),
+            Some(_) => return None,
+        };
+        let (signed, bits) = match (write, ty) {
+            (false, "u8") => (false, 8),
+            (false, "i8") => (true, 8),
+            (false, "u16") => (false, 16),
+            (false, "i16") => (true, 16),
+            (true, "b8") => (false, 8),
+            (true, "b16") => (false, 16),
+            _ => return None,
+        };
+        Some(Self {
+            write,
+            bits,
+            signed,
+            d16,
+        })
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1176,7 +1233,31 @@ impl<'a> Lower<'a> {
                         LaneExit::Branch { when, .. } => Some(when),
                         _ => None,
                     });
-                    let mut all: Vec<Bool> = x
+                    let selects = insts().filter_map(|i| {
+                        let Fields::Valu(v) = &i.fields else {
+                            return None;
+                        };
+                        if !matches!(
+                            i.name(),
+                            "v_cndmask_b32"
+                                | "v_add_co_ci_u32"
+                                | "v_sub_co_ci_u32"
+                                | "v_subrev_co_ci_u32"
+                        ) {
+                            return None;
+                        }
+                        let &Operand::Scalar { code, .. } = v.src.get(2)? else {
+                            return None;
+                        };
+                        if code == NULL {
+                            return None;
+                        }
+                        let m = i.read(Reg::S(code))?;
+                        x.st.masks.get(&m).copied()
+                    });
+                    let mut seen_bools = HashSet::new();
+                    let mut seen_phis = HashSet::new();
+                    let mut work: Vec<Bool> = x
                         .st
                         .guards
                         .iter()
@@ -1184,15 +1265,32 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(selects)
                         .collect();
-                    all.sort_unstable();
-                    all.dedup();
-                    all.into_iter().any(|g| {
-                        x.st.bools
-                            .support(g)
-                            .iter()
-                            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                    }) || insts().any(|i| {
+                    let mut needs_console = false;
+                    while let Some(g) = work.pop() {
+                        if !seen_bools.insert(g) {
+                            continue;
+                        }
+                        for a in x.st.bools.support(g) {
+                            match a {
+                                Atom::Opaque(_) | Atom::Constant(_) => {
+                                    needs_console = true;
+                                    break;
+                                }
+                                Atom::Phi(id) if seen_phis.insert(id) => {
+                                    if let Some(edges) = x.st.phi_masks.get(&id) {
+                                        work.extend(edges.iter().copied());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if needs_console {
+                            break;
+                        }
+                    }
+                    needs_console || insts().any(|i| {
                         matches!(
                             i.name(),
                             "v_cndmask_b32"
@@ -1538,8 +1636,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
@@ -2635,6 +2732,25 @@ impl<'a> Lower<'a> {
         Err("a value defined after its use")
     }
 
+    /// The computed byte offset `a` adds to its parameter's address: its
+    /// computed term, less the parameter's address when that term is a
+    /// pointer that holds it (see [`Address::includes_base`]).
+    fn dynamic_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
+        let Some(d) = a.dynamic else { return Ok(None) };
+        let d = self.i32_of(d)?;
+        if !a.includes_base {
+            return Ok(Some(d));
+        }
+        if a.param == CODE {
+            return Err("an address from a phi");
+        }
+        let base = match self.user(a.param, 0) {
+            Val::I32(x) => x,
+            _ => return Err("an advanced pointer into a root descriptor"),
+        };
+        Ok(Some(self.s.m.bin(self.cur, Bin::Sub, d, base)))
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -3299,6 +3415,7 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        self.s.flags |= flags::WAVE_OPS;
         let lane = if self.s.threads.is_some() && self.emulating_wave64() {
             self.ensure_wave_ids().1
         } else {
@@ -3641,6 +3758,7 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(Some(is0));
         let idv = self.s.m.i32(id as u32);
         let cols = self.s.outputs[id].cols.min(4);
+        self.s.outputs[id].usage |= (1 << cols) - 1;
         for ch in 0..cols {
             let val = if ch == 3 {
                 self.s.m.f32(0x3F80_0000)
@@ -3839,6 +3957,92 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A byte or halfword LDS read or write at byte address `a + offset`,
+    /// through the dword holding it.
+    #[allow(clippy::too_many_arguments)]
+    fn ds_sub_dword(
+        &mut self,
+        inst: &Inst,
+        sub: SubDword,
+        a: V,
+        offset: u32,
+        dst_reg: Option<u8>,
+        data: &[Operand],
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        use super::bitcode::Rmw;
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        // shortcut: as for dwords, in bounds; a halfword is taken as
+        // 2-aligned (the bytes never straddle two dwords).
+        let o = k(self, offset);
+        let at = self.s.m.bin(c, Bin::Add, a, o);
+        let two = k(self, 2);
+        let index = self.s.m.bin(c, Bin::LShr, at, two);
+        let lds = self.s.lds();
+        let p = self.s.m.element(c, lds, index);
+        let three = k(self, 3);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
+        let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+        let mask = k(self, (1 << sub.bits) - 1);
+        if !sub.write {
+            let reg = dst_reg.ok_or("an LDS read result")?;
+            let x = self.s.m.load(c, p);
+            let x = self.s.m.bin(c, Bin::LShr, x, shift);
+            let x = if sub.signed {
+                let up = k(self, 32 - sub.bits);
+                let x = self.s.m.bin(c, Bin::Shl, x, up);
+                self.s.m.bin(c, Bin::AShr, x, up)
+            } else {
+                self.s.m.bin(c, Bin::And, x, mask)
+            };
+            let x = match sub.d16 {
+                None => x,
+                Some(high) => {
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => k(self, 0),
+                    };
+                    let low16 = k(self, 0xFFFF);
+                    let half = self.s.m.bin(c, Bin::And, x, low16);
+                    if high {
+                        let keep = self.s.m.bin(c, Bin::And, old, low16);
+                        let sixteen = k(self, 16);
+                        let half = self.s.m.bin(c, Bin::Shl, half, sixteen);
+                        self.s.m.bin(c, Bin::Or, keep, half)
+                    } else {
+                        let high16 = k(self, 0xFFFF_0000);
+                        let keep = self.s.m.bin(c, Bin::And, old, high16);
+                        self.s.m.bin(c, Bin::Or, keep, half)
+                    }
+                }
+            };
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
+        let d = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+        let d = if sub.d16 == Some(true) {
+            let sixteen = k(self, 16);
+            self.s.m.bin(c, Bin::LShr, d, sixteen)
+        } else {
+            d
+        };
+        let d = self.s.m.bin(c, Bin::And, d, mask);
+        let set = self.s.m.bin(c, Bin::Shl, d, shift);
+        let bits = self.s.m.bin(c, Bin::Shl, mask, shift);
+        let ones = k(self, !0);
+        let clear = self.s.m.bin(c, Bin::Xor, bits, ones);
+        // Lanes write other bytes of the same dword at the same time, so
+        // the bytes go in atomically: cleared, then set. shortcut: lanes
+        // writing the same bytes at once leave both values or-ed together
+        // where the console keeps one of them.
+        let at = self.begin_guarded(guard);
+        self.s.m.atomic(self.cur, Rmw::And, p, clear);
+        self.s.m.atomic(self.cur, Rmw::Or, p, set);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -3948,6 +4152,9 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        if let Some(sub) = SubDword::of(name) {
+            return self.ds_sub_dword(inst, sub, a, offset, dst_reg, data, guard);
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
@@ -4611,16 +4818,19 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if let Some(a) = self.scalar.get(&site).copied()
+                && self
+                    .x
+                    .native
+                    .layout
+                    .get(a.param)
+                    .is_some_and(|p| p.root == RootType::Descriptor)
+            {
+                return self.root_smem(inst, site, a);
+            }
             return self.descriptor_data(inst, site);
         };
-        let count = match rest {
-            "" => 1,
-            "x2" => 2,
-            "x4" => 4,
-            "x8" => 8,
-            "x16" => 16,
-            _ => return Err("a scalar buffer load"),
-        };
+        let count = smem_dwords(rest).ok_or("a scalar buffer load")?;
         let Some(Operand::Scalar { code, .. }) = *data else {
             return Err("a scalar buffer load");
         };
@@ -4652,8 +4862,41 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let srv = matches!(kind, Some(u) if u.kind == ResourceType::Srv);
+        let props = if srv { (11, 0) } else { (13, 0x1_0000) };
+        let h = self.handle(site, src, false, props)?;
+        let constant = match addr {
+            V::Const(_)
+                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
+            {
+                Some(*offset as u32)
+            }
+            _ => None,
+        };
+        let words = self.view_dwords(h, srv, addr, constant, count, size);
+        for (k, x) in words.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `count` dwords from byte `addr` (`constant` when known) of a raw
+    /// buffer (`srv`) or constant buffer view `h`. The address's two low
+    /// bits are ignored, as scalar memory does.
+    fn view_dwords(
+        &mut self,
+        h: V,
+        srv: bool,
+        addr: V,
+        constant: Option<u32>,
+        count: u32,
+        size: Option<V>,
+    ) -> Vec<V> {
+        let c = self.cur;
+        let mut out = Vec::new();
+        if srv {
+            let not3 = self.s.m.i32(!3);
+            let addr = self.s.m.bin(c, Bin::And, addr, not3);
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4677,24 +4920,15 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
                 let x = self.zero_unless(ok, x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
+                out.push(x);
             }
-            return Ok(());
+            return out;
         }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        let constant = match addr {
-            V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
-            {
-                Some(*offset as u32)
-            }
-            _ => None,
-        };
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
-                    let byte = base + 4 * k;
+                    let byte = base.wrapping_add(4 * k);
                     let row = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
@@ -4726,6 +4960,51 @@ impl<'a> Lower<'a> {
                     }
                 }
             };
+            out.push(x);
+        }
+        out
+    }
+
+    /// `s_load_dword*` from the memory of a root CBV or SRV: constants the
+    /// code reads through scalar memory at an address it computes from the
+    /// root descriptor's, read through the root view (a raw buffer for an
+    /// SRV, a constant buffer otherwise).
+    // shortcut: like the console's scalar loads, the host's root views are
+    // not bounds-checked, so a read past the view's data is undefined on
+    // both.
+    fn root_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar memory read as data")?;
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let srv = self
+            .used_kind(&src)
+            .is_some_and(|u| u.kind == ResourceType::Srv);
+        let props = if srv { (11, 0) } else { (13, 0x1_0000) };
+        let h = self.handle(site, &src, false, props)?;
+        let size = self.root_view_size(&src);
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        let constant = a.dynamic.is_none().then_some(a.offset);
+        let words = self.view_dwords(h, srv, addr, constant, count, size);
+        for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -4752,18 +5031,18 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar memory read as data");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
-        // How the program uses the descriptor tells the view's kind. A
-        // waterfall loop that only sizes a lane's entry takes it from a load
-        // of the same entry that an access uses (see `resource::Waterfall`).
-        let use_of = |of: Site| {
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar memory read as data")?;
+        // How the program uses the descriptor tells the view's kind: this
+        // load's dwords, or those of another load of the same descriptor
+        // (the code often loads the whole descriptor for the resource and a
+        // dword or two of it again for its size). `skew` is the dword of
+        // the descriptor this load's first dword is; another load's
+        // descriptor counts only if this load starts inside it.
+        let find = |own: bool| {
             self.x
                 .res
                 .descriptors
@@ -4771,20 +5050,37 @@ impl<'a> Lower<'a> {
                 .filter(|d| d.role == Role::Resource)
                 .find_map(|d| {
                     d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
+                        Source::Loaded { load, first } if (load == site) == own => {
+                            let skew = self.load_skew(inst, site, load)? - i32::from(first);
+                            (own || (0..8).contains(&skew)).then_some((d.site, load, first, skew))
+                        }
                         _ => None,
                     })
                 })
         };
-        let use_at = use_of(site).or_else(|| {
-            let w = &self.x.res.waterfall;
-            let &(_, twin) = w.sizes.iter().find(|s| s.0 == site)?;
-            use_of(twin)
-        });
-        let Some((at, first)) = use_at else {
+        let use_at = find(true)
+            .or_else(|| {
+                let w = &self.x.res.waterfall;
+                let &(_, twin) = w.sizes.iter().find(|s| s.0 == site)?;
+                self.x
+                    .res
+                    .descriptors
+                    .iter()
+                    .filter(|d| d.role == Role::Resource)
+                    .find_map(|d| {
+                        d.source.leaves().into_iter().find_map(|l| match *l {
+                            Source::Loaded { load, first } if load == twin => {
+                                Some((d.site, site, first, -i32::from(first)))
+                            }
+                            _ => None,
+                        })
+                    })
+            })
+            .or_else(|| find(false));
+        let Some((at, load, first, skew)) = use_at else {
             return Err("a descriptor read only as data");
         };
-        let src = Source::Loaded { load: site, first };
+        let src = Source::Loaded { load, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
@@ -4798,9 +5094,12 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    3 => 5,
                     4 => 6,
                     5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+                    6 => 3,
+                    7 => 8,
+                    _ => return Err("an image dimension"),
                 };
                 ((kind | u, 0x409), Some(kind))
             }
@@ -4826,7 +5125,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        let mip = if image.is_some_and(|k| !matches!(k, 3 | 8)) && !uav {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -4841,11 +5140,23 @@ impl<'a> Lower<'a> {
                 let w = field(self, 0);
                 let (height, depth) = match kind {
                     1 => (one, one),
-                    2 => (field(self, 1), one),
+                    2 | 3 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
                     _ => (field(self, 1), field(self, 2)),
                 };
-                let levels = if uav { one } else { field(self, 3) };
+                // The level count only feeds word 3. A level query of a 3D
+                // image inside a loop crashes NVIDIA's Vulkan compiler (vkd3d-
+                // proton turns it into OpImageQueryLevels), so query it only
+                // when the program reads that word as data.
+                let reads_word3 = (0..count)
+                    .filter(|&k| k.wrapping_sub(u32::from(first)) == 3)
+                    .filter_map(|k| inst.write(Reg::S(code + k as u8)))
+                    .any(|v| self.read_as_data(v));
+                let levels = if uav || matches!(kind, 3 | 8) || !reads_word3 {
+                    one
+                } else {
+                    field(self, 3)
+                };
                 let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
                 let (w, height, depth, levels) = (
                     less(self, w),
@@ -4866,7 +5177,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 14, 10, 11, 12, 13, 15][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
@@ -4875,8 +5186,8 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
+            let rel = (k as i32).wrapping_add(skew);
+            match words.iter().find(|w| w.0 as i32 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
@@ -4888,6 +5199,63 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether an instruction or phi reads `v` other than as a resource
+    /// operand of a memory instruction (which takes the descriptor whole).
+    fn read_as_data(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !matches!(
+                        i.fields,
+                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+                    ) && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
+    /// The dword of what the scalar load at `other` reads that `inst` (at
+    /// `site`) reads first: the same base and offset registers, immediates
+    /// a whole number of dwords apart (none for loads that differ
+    /// otherwise). The handle of the other load's descriptor is then built
+    /// from values `inst` reads too.
+    fn load_skew(&self, inst: &Inst, site: Site, other: Site) -> Option<i32> {
+        if other == site {
+            return Some(0);
+        }
+        let o: &Inst = &self.x.p.blocks[other.0].insts[other.1];
+        let (
+            Fields::Smem {
+                base: Operand::Scalar { code: b0, .. },
+                offset: f0,
+                soffset: s0,
+                ..
+            },
+            Fields::Smem {
+                base: Operand::Scalar { code: b1, .. },
+                offset: f1,
+                soffset: s1,
+                ..
+            },
+        ) = (&inst.fields, &o.fields)
+        else {
+            return None;
+        };
+        let reads = |i: &Inst, code: u8| (i.read(Reg::S(code)), i.read(Reg::S(code + 1)));
+        let same_soffset = match (s0, s1) {
+            (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
+            (Operand::Scalar { code: c0, .. }, Operand::Scalar { code: c1, .. }) => {
+                inst.read(Reg::S(*c0)).is_some() && inst.read(Reg::S(*c0)) == o.read(Reg::S(*c1))
+            }
+            _ => false,
+        };
+        let delta = f0.wrapping_sub(*f1);
+        (reads(inst, *b0).0.is_some()
+            && reads(inst, *b0) == reads(o, *b1)
+            && same_soffset
+            && delta % 4 == 0)
+            .then_some(delta / 4)
+    }
+
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
         let Fields::Smem {
@@ -4897,18 +5265,14 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar load");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load from the code"),
-        };
+        let count = inst
+            .name()
+            .strip_prefix("s_load_dword")
+            .and_then(smem_dwords)
+            .ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = self.dynamic_term(&a)? {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -5068,6 +5432,39 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits; the
+    /// others become f16.
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
+        Ok(out)
+    }
+
     /// The dwords a `tbuffer_store_format_*` writes: its `channels` data
     /// channels in buffer format `format`, as RDNA2 lays them out (see
     /// [`buffer_format`]). Formats of 32-bit channels store the data's bits;
@@ -5109,10 +5506,7 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                let x = self.dynamic_term(address)?;
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
@@ -6073,9 +6467,11 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                // An unavailable old value is zero, as for other partial
+                // writes; never resurrect bits from before a full write.
+                let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.i32(0),
                 };
                 let h = self
                     .s
@@ -6533,8 +6929,13 @@ impl<'a> Lower<'a> {
             return self.write_f(inst, f, guard);
         }
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
+            match v.omod {
+                0 => {}
+                k => {
+                    let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
+                    let k = l.s.m.f32(factor.to_bits());
+                    f = l.s.m.bin(l.cur, Bin::Mul, f, k);
+                }
             }
             if v.clamp {
                 f = l.unary(7, f);
@@ -6647,71 +7048,73 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
+        if matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16") {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            // Toward zero, saturating at the 16-bit range (infinities
+            // included); NaN gives 0. Clamped in f32 first, where every
+            // f16 is exact, so the conversion never leaves i32's range.
+            let a = self.half_fsrc(inst, 0)?;
+            let (lo, hi) = if name == "v_cvt_u16_f16" {
+                (0.0f32, 65535.0f32)
+            } else {
+                (-32768.0, 32767.0)
+            };
+            let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
+            let t = self.binary(35, a, lo);
+            let t = self.binary(36, t, hi);
+            let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
+            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            let z = self.s.m.i32(0);
+            let r = self.s.m.select(c, nan, z, r);
+            return self.write_half(inst, r, guard);
+        }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
-        let r = match name {
-            "v_cvt_u16_f16" | "v_cvt_i16_f16" => {
-                // Toward zero, saturating at the 16-bit range (infinities
-                // included); NaN gives 0. Clamped in f32 first, where every
-                // f16 is exact, so the conversion never leaves i32's range.
-                let a = self.half_fsrc(inst, 0)?;
-                let (lo, hi) = if name == "v_cvt_u16_f16" {
-                    (0.0f32, 65535.0f32)
-                } else {
-                    (-32768.0, 32767.0)
-                };
-                let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
-                let t = self.binary(35, a, lo);
-                let t = self.binary(36, t, hi);
-                let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-                let nan = self.s.m.cmp(c, pred::UNO, a, a);
-                let z = self.s.m.i32(0);
-                self.s.m.select(c, nan, z, r)
+        let r = {
+            let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let k16 = self.s.m.i32(16);
+            let sext = |l: &mut Self, x: V| {
+                let t = l.s.m.bin(c, Bin::Shl, x, k16);
+                l.s.m.bin(c, Bin::AShr, t, k16)
+            };
+            if name.ends_with("_i16") {
+                a = sext(self, a);
+                b = sext(self, b);
             }
-            _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
-                };
-                if name.ends_with("_i16") {
-                    a = sext(self, a);
-                    b = sext(self, b);
+            let k15 = self.s.m.i32(15);
+            match name {
+                "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
+                "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
+                "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
+                    // src0 is the shift (4 bits), src1 the value.
+                    let sh = self.s.m.bin(c, Bin::And, a, k15);
+                    let x = if name == "v_ashrrev_i16" {
+                        sext(self, b)
+                    } else {
+                        b
+                    };
+                    let op = match name {
+                        "v_lshlrev_b16" => Bin::Shl,
+                        "v_lshrrev_b16" => Bin::LShr,
+                        _ => Bin::AShr,
+                    };
+                    self.s.m.bin(c, op, x, sh)
                 }
-                let k15 = self.s.m.i32(15);
-                match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
-                    "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
-                    "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
-                    "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
-                        // src0 is the shift (4 bits), src1 the value.
-                        let sh = self.s.m.bin(c, Bin::And, a, k15);
-                        let x = if name == "v_ashrrev_i16" {
-                            sext(self, b)
-                        } else {
-                            b
-                        };
-                        let op = match name {
-                            "v_lshlrev_b16" => Bin::Shl,
-                            "v_lshrrev_b16" => Bin::LShr,
-                            _ => Bin::AShr,
-                        };
-                        self.s.m.bin(c, op, x, sh)
-                    }
-                    _ => {
-                        let p = match name {
-                            "v_max_u16" => pred::IUGT,
-                            "v_min_u16" => pred::IULT,
-                            "v_max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, a, b);
-                        self.s.m.select(c, t, a, b)
-                    }
+                _ => {
+                    let p = match name {
+                        "v_max_u16" => pred::IUGT,
+                        "v_min_u16" => pred::IULT,
+                        "v_max_i16" => pred::SGT,
+                        _ => pred::SLT,
+                    };
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
                 }
             }
         };
@@ -7661,6 +8064,8 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            6 if name == "image_load" || name == "image_get_resinfo" => (3, 2),
+            7 if name == "image_load" || name == "image_get_resinfo" => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -7831,11 +8236,8 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to write channels of a float format
+            // (the console converts by the view's format).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -7844,14 +8246,20 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
+            let fu = self.s.m.undef(self.s.t.f32);
+            let mut vals = Vec::with_capacity(4);
+            let mut idx = 0u8;
             for k in 0..4u8 {
+                if dmask >> k & 1 == 0 {
+                    vals.push(fu);
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { idx / 2 } else { idx };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if idx % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -7861,13 +8269,14 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                idx += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
-            args.push(self.s.m.i8(0xF));
+            args.push(self.s.m.i8(*dmask));
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
@@ -7900,7 +8309,7 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav || matches!(kind, 3 | 8) {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -7913,7 +8322,7 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
+                2 | 3 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
@@ -8157,7 +8566,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
-            let mip = if name == "image_load_mip" {
+            let mip = if name == "image_load_mip" || matches!(kind, 3 | 8) {
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -8289,9 +8698,12 @@ impl<'a> Lower<'a> {
         let store = name.starts_with("buffer_store_") || name.starts_with("tbuffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
-        let atomic = match name.strip_prefix("buffer_atomic_") {
+        let atomic_raw = name.strip_prefix("buffer_atomic_");
+        let wide = atomic_raw.is_some_and(|n| n.ends_with("_x2"));
+        let atomic_op = atomic_raw.map(|n| n.strip_suffix("_x2").unwrap_or(n));
+        let atomic = match atomic_op {
             None => None,
-            Some("add") => Some(0),
+            Some("add" | "sub") => Some(0),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -8303,8 +8715,9 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first (buffer and
+        // tbuffer formats alike).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -8312,7 +8725,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
             .or(plain.strip_prefix("tbuffer_store_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() => (false, if wide { 2 } else { 1 }),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8404,8 +8817,33 @@ impl<'a> Lower<'a> {
             _ => (off, None),
         };
         if let Some(op) = atomic {
+            let cmpswap = op == u32::MAX;
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let dwords = match (wide, cmpswap) {
+                (false, false) => 1,
+                (false, true) | (true, false) => 2,
+                (true, true) => 4,
+            };
+            let vals = self.vgprs(inst, d, dwords)?;
+            let (ty, sfx) = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE;
+                (self.s.m.int(64), "i64")
+            } else {
+                (self.s.t.i32, "i32")
+            };
+            let mut val = if wide {
+                self.pack64(vals[0], vals[1])
+            } else {
+                vals[0]
+            };
+            if atomic_op == Some("sub") {
+                let zero = if wide {
+                    self.s.m.int_const(ty, 0)
+                } else {
+                    self.s.m.i32(0)
+                };
+                val = self.s.m.bin(c, Bin::Sub, zero, val);
+            }
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -8428,36 +8866,66 @@ impl<'a> Lower<'a> {
                 return Err("buffer atomic data");
             };
             let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if returns => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let old = if wide {
+                match (
+                    returns,
+                    inst.read(Reg::V(reg)),
+                    inst.read(Reg::V(reg + 1)),
+                ) {
+                    (true, Some(lo), Some(hi)) => {
+                        let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                        self.pack64(lo, hi)
+                    }
+                    _ => self.s.m.int_const(ty, 0),
+                }
+            } else {
+                match inst.read(Reg::V(reg)) {
+                    Some(v) if returns => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                }
             };
             let access = self.narrow(guard, root_ok);
             let at = self.begin_guarded(access);
-            let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
+            let r = if cmpswap {
                 // cmpswap: data is (new, compare).
+                let cmp = if wide {
+                    self.pack64(vals[2], vals[3])
+                } else {
+                    vals[1]
+                };
                 let mut args = vec![h];
                 args.extend(coords);
-                args.extend([vals[1], vals[0]]);
+                args.extend([cmp, val]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{sfx}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
             } else {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                args.push(val);
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -8510,16 +8978,17 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write channels of a float
+                // format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                args.resize(3 + 4, self.s.m.undef(self.s.t.f32));
                 (69, "bufferStore.f32")
             } else {
                 match index {
@@ -8543,7 +9012,7 @@ impl<'a> Lower<'a> {
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")
             };
-            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
+            args.push(self.s.m.i8((1u8 << count) - 1));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
@@ -8562,7 +9031,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 let x = self.zero_unless(root_ok, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
@@ -9100,6 +9573,26 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        while let Some((v, b, i)) = self.pending_masks.pop() {
+            let phi = &p.blocks[b].phis[i];
+            let offset = p.blocks[b].offset;
+            let args = self
+                .x
+                .st
+                .phi_masks
+                .get(&phi.value)
+                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = self
+                    .boolean(args[n], qb)
+                    .map_err(|w| unsupported(offset, w))?;
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
@@ -9143,29 +9636,13 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -9205,6 +9682,113 @@ mod tests {
             options: super::TranslateOptions::default(),
         })
         .map(|_| ())
+    }
+
+    fn lowers_cs(
+        words: &[u32],
+        wave64: bool,
+        const_sgprs: u8,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        use crate::native::{RootParam, RootType};
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let layout = if const_sgprs > 0 {
+            vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: u32::from(const_sgprs),
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }]
+        } else {
+            vec![]
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout,
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: u32::from(const_sgprs) << 1,
+                threads: [if wave64 { 64 } else { 32 }, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            options: super::TranslateOptions::default(),
+        })
+    }
+
+    #[test]
+    fn lane_mask_phi_joining_zero_and_compare_lowers() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
+        let words = [
+            0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+            0xBE82_0380, // 8: s_mov_b32 s2, 0
+            0xBF82_0002, // 12: s_branch -> 24
+            0xD4C2_0002,
+            0x0002_0080, // 16: v_cmp_eq_u32 s2, 0, v0
+            0xD501_0001,
+            cnd, // 24: v_cndmask_b32 v1, 1, 2, s2
+            S_ENDPGM,
+        ];
+        lowers_cs(&words, false, 1).unwrap();
+    }
+
+    #[test]
+    fn wave64_loop_mask_accumulator_from_zero_lowers() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s[2:3]
+        let words = [
+            0xBE82_0480, // 0: s_mov_b64 s[2:3], 0
+            0xBE84_0380, // 4: s_mov_b32 s4, 0
+            0xD501_0001,
+            cnd,         // 8: v_cndmask_b32 v1, 1, 2, s[2:3]
+            0x7D84_0080, // 16: v_cmp_eq_u32 vcc, 0, v0
+            0x8882_026A, // 20: s_or_b64 s[2:3], vcc, s[2:3]
+            0x8004_8104, // 24: s_add_u32 s4, s4, 1
+            0xBF0A_8404, // 28: s_cmp_lt_u32 s4, 4
+            0xBF85_FFF9, // 32: s_cbranch_scc1 -> 8
+            0xD501_0004,
+            cnd, // 36: v_cndmask_b32 v4, 1, 2, s[2:3]
+            S_ENDPGM,
+        ];
+        lowers_cs(&words, true, 0).unwrap();
+    }
+
+    #[test]
+    fn lane_mask_phi_with_partial_constant_enables_console_lanes() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
+        let words = [
+            0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+            0xBE82_038F, // 8: s_mov_b32 s2, 15 (partial constant mask 0xF)
+            0xBF82_0002, // 12: s_branch -> 24
+            0xD4C2_0002,
+            0x0002_0080, // 16: v_cmp_eq_u32 s2, 0, v0
+            0xD501_0001,
+            cnd, // 24: v_cndmask_b32 v1, 1, 2, s2
+            S_ENDPGM,
+        ];
+        let lowered = lowers_cs(&words, false, 1).unwrap();
+        assert!(
+            !lowered.dxil.is_empty(),
+            "expected DXIL with WaveSize(32) and WAVE_OPS"
+        );
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -9269,6 +9853,194 @@ mod tests {
         }
     }
 
+    /// The view a root descriptor at `user_data` is.
+    fn root_view(kind: ResourceType, user_data: u8, slot: u8) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data,
+            slot,
+        }
+    }
+
+    #[test]
+    fn constants_loaded_from_a_root_view() {
+        // Two dwords at byte 0x10 of the memory of a root descriptor (in
+        // s[0:1]) read with s_load and branched on: read through the root
+        // CBV, or the root SRV when the root signature says it is one.
+        let words = [
+            0xF404_0080,
+            0xFA00_0010, // s_load_dwordx2 s[2:3], s[0:1], 0x10
+            0x8002_0302, // s_add_u32 s2, s2, s3
+            0xBF06_8502, // s_cmp_eq_u32 s2, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Descriptor, 0, 3)];
+        let cbv = lower_with(&words, layout(), vec![]).unwrap();
+        assert_eq!((cbv.root_cbvs, cbv.root_srvs), (vec![3], vec![]));
+        let used = vec![root_view(ResourceType::Srv, 0, 3)];
+        let srv = lower_with(&words, layout(), used).unwrap();
+        assert_eq!((srv.root_cbvs, srv.root_srvs), (vec![], vec![3]));
+        // A root UAV's memory has no read-only host view.
+        let used = vec![root_view(ResourceType::Uav, 0, 3)];
+        assert!(lower_with(&words, layout(), used).is_err());
+    }
+
+    #[test]
+    fn a_dword_of_a_descriptor_another_load_reads_whole() {
+        // A 2D image's descriptor (a table range at s0) loaded whole for
+        // image_get_resinfo, and its dword 2 (width and height) loaded
+        // again alone and branched on.
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E04_0480, // v_mov_b32 v2, 0
+            0xF038_0308,
+            0x0001_0402, // image_get_resinfo v[4:5], v2, s[4:11] dim:SQ_RSRC_IMG_2D
+            0xF400_0300,
+            0xFA00_0008, // s_load_dword s12, s[0:1], 0x8
+            0xBF06_850C, // s_cmp_eq_u32 s12, 5
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout(), vec![]).unwrap();
+        // Dword 2 of the next descriptor: no load of it is used.
+        let mut next = words;
+        next[7] = 0xFA00_0028;
+        let e = lower_with(&next, layout(), vec![]).err().unwrap();
+        assert!(
+            e.to_string().contains("a descriptor read only as data"),
+            "{e}"
+        );
+    }
+
+    /// A table at s0 holding structured buffers of dwords.
+    fn dword_buffers() -> Vec<UsedResource> {
+        vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }]
+    }
+
+    #[test]
+    fn descriptors_loaded_through_pointers_kept_in_phis() {
+        // A buffer descriptor loaded from the table at s0 through a pointer
+        // a root constant (s1) picks by a branch, then loaded through by
+        // index and stored to LDS so the load is needed.
+        let picked = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8004_9000, // s_add_u32 s4, s0, 16
+            0xBF82_0001, // s_branch -> 0x14
+            0x8004_A000, // 0x10: s_add_u32 s4, s0, 32
+            0xBE85_0380, // 0x14: s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // The same through a pointer advanced over four descriptors.
+        let advanced = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xF408_0202,
+            0xFA00_0000, // 0xc: s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0x8004_9004, // s_add_u32 s4, s4, 16
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF6, // s_cbranch_scc1 -> 0xc
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_with(&picked, layout(), dword_buffers()).unwrap();
+        lower_with(&advanced, layout(), dword_buffers()).unwrap();
+    }
+
+    #[test]
+    fn data_read_through_a_pointer_into_a_root_descriptor_stops() {
+        // A root descriptor's address (s[0:1]) advanced in a loop and read
+        // through: its address is no value the translation has, so the
+        // offset from it is unknown.
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0301, // s_mov_b32 s3, s1
+            0xF400_0101,
+            0xFA00_0000, // 0x8: s_load_dword s4, s[2:3], null
+            0x8002_9002, // s_add_u32 s2, s2, 16
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
+            S_ENDPGM,
+        ];
+        let e = lower_with(&words, vec![root(RootType::Descriptor, 0, 3)], vec![])
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string()
+                .contains("an advanced pointer into a root descriptor"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn sub_dword_lds_names() {
+        let s = |write, bits, signed, d16| {
+            Some(SubDword {
+                write,
+                bits,
+                signed,
+                d16,
+            })
+        };
+        assert_eq!(SubDword::of("ds_read_i8"), s(false, 8, true, None));
+        assert_eq!(SubDword::of("ds_read_u16"), s(false, 16, false, None));
+        assert_eq!(
+            SubDword::of("ds_read_u8_d16"),
+            s(false, 8, false, Some(false))
+        );
+        assert_eq!(
+            SubDword::of("ds_read_i16_d16_hi"),
+            s(false, 16, true, Some(true))
+        );
+        assert_eq!(SubDword::of("ds_write_b8"), s(true, 8, false, None));
+        assert_eq!(
+            SubDword::of("ds_write_b16_d16_hi"),
+            s(true, 16, false, Some(true))
+        );
+        for name in [
+            "ds_read_b32",
+            "ds_read2_b32",
+            "ds_write_b64",
+            "ds_write_b8_d16",
+            "ds_read_u8_d32",
+            "ds_add_u32",
+        ] {
+            assert_eq!(SubDword::of(name), None, "{name}");
+        }
+    }
     #[test]
     fn a_scalar_carry_chain_reaches_the_select() {
         // The high dword of a 64-bit add or subtract, then a select on the
@@ -9731,6 +10503,85 @@ mod tests {
     }
 
     #[test]
+    fn buffer_atomics_64_bit_lower_with_heap_int64_flag() {
+        use crate::native::{RootParam, RootType};
+
+        let run = |mubuf_w0: u32| {
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF408_0100,    // s_load_dwordx4 s[4:7], s[0:1], null
+                0xFA00_0000,
+                0x7E00_0280,    // v_mov_b32 v0, 0
+                0x7E02_0280,    // v_mov_b32 v1, 0
+                0x7E04_0281,    // v_mov_b32 v2, 1
+                0x7E06_0280,    // v_mov_b32 v3, 0
+                0x7E08_0282,    // v_mov_b32 v4, 2
+                0x7E0A_0280,    // v_mov_b32 v5, 0
+                mubuf_w0,
+                0x0001_0200,    // rsrc s[4:7], vdata v2, vaddr v0
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 8).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                options: Default::default(),
+            })
+        };
+
+        // buffer_atomic_add_x2 (op 0x52)
+        let add = run(0xE148_0000).unwrap();
+        // buffer_atomic_cmpswap_x2 (op 0x51)
+        let cmp = run(0xE144_0000).unwrap();
+        // buffer_atomic_sub_x2 (op 0x53)
+        let sub = run(0xE14C_0000).unwrap();
+        for lowered in [add, cmp, sub] {
+            let sfi0 = crate::dxbc::Container::parse(&lowered.dxil)
+                .unwrap()
+                .part(crate::dxbc::FourCC::SFI0)
+                .unwrap()
+                .data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_ne!(features & 0x8000, 0, "INT64 feature bit missing");
+            assert_ne!(
+                features & 0x1000_0000,
+                0,
+                "ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE feature bit missing"
+            );
+        }
+    }
+
+    #[test]
     fn image_sample_d_cl_and_gather4_l_translate() {
         use crate::native::{RootParam, RootType};
         let param = |root: RootType, user_data: u8, sgprs: u32| RootParam {
@@ -9834,5 +10685,292 @@ mod tests {
             options: Default::default(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn cube_and_msaa_descriptor_data_lower() {
+        use crate::native::{RootParam, RootType};
+
+        for dim in [3u32, 6, 7] {
+            // s_mov_b32 s1, 0
+            // s_load_dwordx8 s[4:11], s[0:1], null
+            // s_lshr_b32 s12, s7, 16        (reads descriptor word 3 as data)
+            // s_cmp_lg_u32 s12, 0
+            // s_cbranch_scc1 -> s_endpgm
+            // s_mov_b32 s13, 0
+            // v_mov_b32 v0..v3, 0
+            // image_get_resinfo (dim) v0, v0, s[4:11]  (op 0x0e, dmask=1)
+            // s_endpgm
+            let mimg_w0 = 0xF000_0000 | (0x0E << 18) | (1 << 8) | (dim << 3);
+            let words = [
+                0xBE81_0380u32,
+                0xF40C_0100,
+                0xFA00_0000,
+                0x900C_9007,
+                0xBF07_800C,
+                0xBF85_0001,
+                0xBE8D_0380,
+                0x7E00_0280,
+                mimg_w0,
+                0x0001_0000,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                options: Default::default(),
+            });
+            // Cube (3) and MSAA (6, 7) descriptor_data() all lower without failing
+            // on "an image dimension (cube or MSAA)".
+            out.unwrap();
+        }
+    }
+
+    #[test]
+    fn msaa_image_load_and_get_resinfo_lower() {
+        use crate::native::{RootParam, RootType};
+
+        for (dim, op) in [(6u32, 0x00u32), (6, 0x0E), (7, 0x00), (7, 0x0E)] {
+            // s_mov_b32 s1, 0
+            // s_load_dwordx8 s[4:11], s[0:1], null
+            // v_mov_b32 v0..v3, 0
+            // image_load (0x00) / image_get_resinfo (0x0e) v[0..3], v[0..3], s[4:11]
+            // v_cmp_ne_u32 vcc, v0, 0
+            // s_cbranch_vccz -> s_endpgm
+            // s_mov_b32 s12, 0
+            // s_endpgm
+            let mimg_w0 = 0xF000_0000 | (op << 18) | (0xF << 8) | (dim << 3);
+            let words = [
+                0xBE81_0380u32,
+                0xF40C_0100,
+                0xFA00_0000,
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                mimg_w0,
+                0x0001_0000,
+                0x7D9A_0080,
+                0xBF81_0000,
+                0xBE8C_0380,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                options: Default::default(),
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_channel_typed_buffer_store_lowers() {
+        // MUBUF buffer_store_format_{x,xy,xyz,d16_xyz} (ops 0x04, 0x05, 0x06, 0x86)
+        // with idxen=1, vaddr=v0, vdata=v1, srsrc=s[4:7].
+        for op in [0x04u32, 0x05, 0x06, 0x86] {
+            let mubuf_w0 = 0xE000_2000 | (op << 18);
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx4 s[4:7], s[0:1], null
+                0xF408_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // buffer_store_format_* v[1..], v0, s[4:7], 0 idxen
+                mubuf_w0,
+                0x8001_0100,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                options: Default::default(),
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_channel_image_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        // image_store (op 0x08), dim=1 (2D), unorm=1
+        // Test 32-bit partial masks (0x1, 0x3, 0x5) and d16 partial mask (0x7).
+        for (dmask, d16) in [(0x1u32, false), (0x3, false), (0x5, false), (0x7, true)] {
+            let mimg_w0 = 0xF000_0000
+                | (0x08 << 18)
+                | (u32::from(d16) << 15)
+                | (dmask << 8)
+                | (1 << 7)
+                | (1 << 3);
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx8 s[4:11], s[0:1], null
+                0xF40C_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0 (coords v0..v1, data v2..v3)
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // image_store v[2..], v[0..1], s[4:11]
+                mimg_w0,
+                0x0001_0200,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                options: Default::default(),
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn descriptor_level_count_only_queried_when_word_3_read() {
+        use crate::resource::tests::WATERFALL_SIZED_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        // Sizing loop reading word 2 (s26) - word 3 is NOT read.
+        let l_no_w3 = lower_wave(WATERFALL_SIZED_WAVE32, layout.clone(), used.clone(), false).unwrap();
+        assert_eq!(l_no_w3.nonuniform_handles, 2);
+
+        // Modify the sizing instruction to read word 3 (s27) instead of s26:
+        let mut words = WATERFALL_SIZED_WAVE32.to_vec();
+        // 0x9396_FF1A is s_bfe_u32 s22, s26, 0x10000e. Replace s26 with s27 (0x9396_FF1B).
+        let pos = words.iter().position(|&w| w == 0x9396_FF1A).unwrap();
+        words[pos] = 0x9396_FF1B;
+        let l_with_w3 = lower_wave(&words, layout, used, false).unwrap();
+        assert_eq!(l_with_w3.nonuniform_handles, 2);
     }
 }

@@ -38,10 +38,13 @@ This document tracks the current execution state, verified engine milestones, an
 
 ### 1. In-Engine 3D Rendering (Dark Screen Post-Title Card)
 - **Symptom:** After the title card, audio and game simulation continue at 30 FPS, but the 3D scene renders black/dark.
-- **Root Cause:**
-  - Modern RDNA2 shaders in the engine make heavy use of 64-bit typed image atomics (`imageAtomicAdd`, etc.) which require Shader Model 6.6 extension mapping on host DirectX 12.
-  - Raytracing acceleration structures (BVH) built via Xbox-specific BVH routines (`XboxBvhBuilder.dll`) require translation to standard D3D12 DXR 1.1 Top-Level and Bottom-Level acceleration structures (TLAS/BLAS).
-- **Solution in Development:** PR #705 (SM 6.6 64-bit atomics) & PR #702 (native DXR 1.1 translation).
+- **Root Cause & Progress:**
+  - Modern RDNA2 shaders in the engine make heavy use of 64-bit typed image atomics and root argument spill tables.
+  - **Implemented in v0.2.0:** 64-bit buffer atomics & sub-opcodes in `lower.rs`.
+  - **Implemented in v0.2.0:** Lane-mask phi edge tracking, resolving untracked mask joins.
+  - **Implemented in v0.2.0:** Memory-spilled root argument tables (unrecognized parameter failures dropped from 34 to 4 on world shaders).
+  - **Implemented in v0.2.0:** GPU-driven indirect rectangle draws and world loading RAM reduction.
+  - **Remaining:** DXR 1.1 Top-Level and Bottom-Level acceleration structures (TLAS/BLAS) translation for Xbox BVH structures.
 
 ### 2. Driver TDR / Device Removed (`0x887A0005` / `0x887A0006`)
 - **Symptom:** GPU driver timeout during heavy compute dispatch loops.

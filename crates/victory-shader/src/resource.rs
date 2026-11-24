@@ -31,6 +31,12 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// `dynamic` is a pointer the code keeps in a phi (advanced in a loop,
+    /// or picked by a branch between offsets from the parameter): it holds
+    /// the parameter's address plus a varying offset, so the byte offset
+    /// from the parameter is `dynamic` minus the parameter's first dword,
+    /// plus `offset`. Never set for [`CODE`].
+    pub includes_base: bool,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -362,6 +368,8 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// Steps through phis and additions when tracing a pointer kept in a phi.
+const MAX_POINTER_STEPS: usize = 256;
 
 type ValueTables = (
     Vec<Option<Site>>,
@@ -556,8 +564,10 @@ impl<'a> Tracer<'a> {
             dynamic: Some(v),
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
+            // A root constant is a number the code adds (a byte offset into
+            // a table, say), not a base.
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((i, 0)) if self.layout[i].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -571,6 +581,11 @@ impl<'a> Tracer<'a> {
                 offset: 0,
                 dynamic: None,
             };
+        }
+        if let Some((x, k)) = self.plus_const(v) {
+            let mut s = self.sum(x);
+            s.offset = s.offset.wrapping_add(k);
+            return s;
         }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
@@ -588,6 +603,27 @@ impl<'a> Tracer<'a> {
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
         }
+    }
+
+    /// `v` as another dword plus a constant: `s_addk_i32` (in place, a
+    /// sign-extended immediate) or `s_sub_u32`/`s_sub_i32` of a constant.
+    fn plus_const(&self, v: Value) -> Option<(Term, u32)> {
+        if let Some((_, [x, Term::Const(c)])) = self.sop2(v, &["s_sub_u32", "s_sub_i32"]) {
+            return Some((x, c.wrapping_neg()));
+        }
+        let inst = self.def(v)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            imm: Some(imm),
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        (inst.name() == "s_addk_i32" && inst.writes.first()?.1 == v).then_some((
+            self.origin(inst.read(Reg::S(code))?),
+            i32::from(imm as i16) as u32,
+        ))
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -699,6 +735,12 @@ impl<'a> Tracer<'a> {
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
+        if s.base.is_none()
+            && let Some(d) = s.dynamic
+            && self.phis[d.0 as usize].is_some()
+        {
+            return self.pointer_address(d, s.offset.wrapping_add(extra.offset), hi);
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -712,6 +754,7 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                includes_base: false,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -739,15 +782,175 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            includes_base: false,
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// The address of a pointer `d` the code keeps in a phi, plus `offset`:
+    /// each argument of the phi is the same root parameter's address plus
+    /// offsets, or the phi itself (or another such phi) plus offsets, as a
+    /// pointer advanced in a loop or picked by a branch. `d` then holds that
+    /// parameter's address plus a varying term (see
+    /// [`Address::includes_base`]).
+    fn pointer_address(&self, d: Value, offset: u32, hi: Term) -> Result<Address, &'static str> {
+        const WHY: &str = "an address from a phi";
+        let mut budget = MAX_POINTER_STEPS;
+        let base = self
+            .pointer_base(Term::Value(d), &mut Vec::new(), &mut budget)
+            .ok()
+            .flatten()
+            .ok_or(WHY)?;
+        let reg = self.inputs[base.0 as usize].ok_or(WHY)?;
+        let (param, _) = self.param_of(reg).ok_or(WHY)?;
+        let high = match self.layout[param].root {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
+            RootType::Descriptor => {
+                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                Some(input.ok_or("a root descriptor without its high half")?.1)
+            }
+            _ => return Err("an address from a root parameter that is no address"),
+        };
+        if !self.pointer_high(hi, high, &mut Vec::new(), &mut budget) {
+            return Err("an address with an untracked high half");
+        }
+        Ok(Address {
+            param,
+            offset,
+            dynamic: Some(d),
+            includes_base: true,
+        })
+    }
+
+    /// The root parameter (its first dword) that the pointer `t` is an
+    /// offset from: `None` when it only goes around the phis in `seen`
+    /// (the back edge of a loop), an error when it is no such pointer or
+    /// mixes two parameters. `budget` bounds the walk.
+    fn pointer_base(
+        &self,
+        t: Term,
+        seen: &mut Vec<Value>,
+        budget: &mut usize,
+    ) -> Result<Option<Value>, ()> {
+        *budget = budget.checked_sub(1).ok_or(())?;
+        let Term::Value(v) = t else { return Err(()) };
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        if let Some(base) = self.sum(t).base {
+            // Program-counter tables are not tracked through phis.
+            return match self.inputs[base.0 as usize] {
+                Some(_) => Ok(Some(base)),
+                None => Err(()),
+            };
+        }
+        if let Some((block, i)) = self.phis[v.0 as usize] {
+            seen.push(v);
+            let mut found = None;
+            let mut result = Ok(());
+            for &a in &self.p.blocks[block].phis[i].args {
+                match self.pointer_base(self.vorigin(a), seen, budget) {
+                    Ok(None) => {}
+                    Ok(Some(b)) if found.is_none_or(|f| f == b) => found = Some(b),
+                    _ => {
+                        result = Err(());
+                        break;
+                    }
+                }
+            }
+            seen.pop();
+            return result.map(|()| found);
+        }
+        if let Some((x, _)) = self.plus_const(v) {
+            return self.pointer_base(x, seen, budget);
+        }
+        let [a, b] = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))
+            .ok_or(())?;
+        // One side is the pointer, the other an offset.
+        match (
+            self.pointer_base(a, seen, budget),
+            self.pointer_base(b, seen, budget),
+        ) {
+            (Ok(p), Err(())) | (Err(()), Ok(p)) => Ok(p),
+            _ => Err(()),
+        }
+    }
+
+    /// `hi` matches `high` through phis, `s_addc_u32`, and `s_subb_u32 0`.
+    fn pointer_high(
+        &self,
+        hi: Term,
+        high: Option<Value>,
+        seen: &mut Vec<Value>,
+        budget: &mut usize,
+    ) -> bool {
+        let Some(left) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = left;
+        if self.high_half(hi, high) || high.is_some_and(|h| self.carried(hi, h)) {
+            return true;
+        }
+        let Term::Value(v) = hi else { return false };
+        if seen.contains(&v) {
+            return true;
+        }
+        if let Some((block, i)) = self.phis[v.0 as usize] {
+            seen.push(v);
+            let ok = self.p.blocks[block].phis[i]
+                .args
+                .iter()
+                .all(|&a| self.pointer_high(self.vorigin(a), high, seen, budget));
+            seen.pop();
+            return ok;
+        }
+        let carry = self
+            .sop2(v, &["s_addc_u32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd_carry(v));
+        let borrow = self
+            .sop2(v, &["s_subb_u32"])
+            .and_then(|(_, [a, b])| (b == Term::Const(0)).then_some([a, b]));
+        match carry.or(borrow) {
+            Some([x, Term::Const(0)]) | Some([Term::Const(0), x]) => {
+                self.pointer_high(x, high, seen, budget)
+            }
+            _ => false,
+        }
+    }
+
+    /// The operands of a `v_add_co_ci_u32` writing `v` (the carry-in
+    /// aside), through VGPR copies of scalars.
+    fn vadd_carry(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32" || inst.write(Reg::V(reg)) != Some(v) {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+        ])
+    }
+
+    /// `hi` is `high` (0 for a table), possibly plus a carry or minus a
+    /// borrow.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+            ))
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_subb_u32"]).is_some_and(
+                |(_, [a, b])| a == want && b == Term::Const(0)
             ))
     }
 
@@ -1875,6 +2078,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            includes_base: false,
         }
     }
 
@@ -2115,6 +2319,165 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn root_constants_are_offsets_added_to_a_table() {
+        let r = track_words(
+            &[
+                0x8002_0409, // s_add_u32 s2, s9, s4
+                0xB782_0100, // s_addk_i32 s2, 0x100
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0101,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(Constants, 4, 1)],
+            HwStage::Ps,
+        );
+        let constant = r.params.iter().find(|p| p.1 == 1).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 3),
+                Address {
+                    param: 0,
+                    offset: 0x100,
+                    dynamic: Some(constant),
+                    includes_base: false,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn constants_subtracted_from_a_root_descriptor_borrow_from_its_high_half() {
+        let r = track_words(
+            &[
+                0x8080_900A, // s_sub_u32 s0, s10, 16
+                0x8281_800B, // s_subb_u32 s1, s11, 0
+                0xF400_0080,
+                0xFA00_0020, // s_load_dword s2, s[0:1], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x10))]);
+    }
+
+    /// The phi a pointer address reads, and the block it joins in.
+    fn pointer_phi(p: &Program, a: &Address) -> usize {
+        let d = a.dynamic.expect("a computed term");
+        p.blocks
+            .iter()
+            .position(|b| b.phis.iter().any(|phi| phi.value == d))
+            .expect("a phi")
+    }
+
+    #[test]
+    fn pointers_advanced_in_a_loop_are_offsets_from_their_table() {
+        let code: Vec<u8> = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xF40C_0201,
+            0xFA00_0000, // 0xc: s_load_dwordx8 s[8:15], s[2:3], null
+            0x8002_A002, // s_add_u32 s2, s2, 32
+            0x8203_8003, // s_addc_u32 s3, s3, 0
+            0x8004_8104, // s_add_u32 s4, s4, 1
+            0xBF07_8404, // s_cmp_lg_u32 s4, 4
+            0xBF85_FFF9, // s_cbranch_scc1 -> 0xc
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        let [(site, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0, true));
+        // The pointer is the loop header's phi of s2.
+        assert_eq!(pointer_phi(&p, &a), site.0);
+    }
+
+    #[test]
+    fn pointers_picked_by_a_branch_are_offsets_from_their_table() {
+        let code: Vec<u8> = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8002_A009, // s_add_u32 s2, s9, 32
+            0xBF82_0001, // s_branch -> 0x14
+            0x8002_C009, // 0x10: s_add_u32 s2, s9, 64
+            0xBE83_0380, // 0x14: s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0010, // s_load_dwordx8 s[8:15], s[2:3], 0x10
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        let [(site, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0x10, true));
+        assert_eq!(pointer_phi(&p, &a), site.0);
+    }
+
+    #[test]
+    fn pointers_into_a_root_descriptor_carry_into_its_high_half() {
+        let r = track_words(
+            &[
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030B, // s_mov_b32 s1, s11
+                0xF400_0080,
+                0xFA00_0000, // 0x8: s_load_dword s2, s[0:1], null
+                0x8000_9000, // s_add_u32 s0, s0, 16
+                0x8201_8001, // s_addc_u32 s1, s1, 0
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF84_FFFA, // s_cbranch_scc0 -> 0x8
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset, a.includes_base), (0, 0, true));
+    }
+
+    #[test]
+    fn pointers_from_two_parameters_fail() {
+        let code: Vec<u8> = [
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x10
+            0x8002_A009, // s_add_u32 s2, s9, 32
+            0xBF82_0001, // s_branch -> 0x14
+            0x8002_C008, // 0x10: s_add_u32 s2, s8, 64
+            0xBE83_0380, // 0x14: s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0000, // 0x18: s_load_dwordx8 s[8:15], s[2:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(
+            &p,
+            &[param(Table, 8, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+            lanes(&p).as_ref(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x18,
+                what: "an address from a phi"
+            }
+        );
+    }
     fn untraceable_addresses_fail_with_a_reason() {
         let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
             .iter()

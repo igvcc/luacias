@@ -5,6 +5,8 @@
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
+//! Non-indexed rectangle-list draws follow the clamp with GPU-side
+//! rectangle expansion in [`crate::rectangles`].
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -190,14 +192,15 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
+/// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer` (bounded by `count` when present), and leaves the buffers ready
-/// to be read as arguments. Replaces the list's compute root signature and
-/// pipeline (callers bind theirs after). False if the clamp is not
-/// available.
-pub(crate) fn bound(
+/// `buffer` (bounded by `count` when present), leaving the buffer in
+/// unordered-access state with a UAV barrier after the write (for passes such
+/// as [`crate::rectangles`] that read the clamped records in another compute
+/// shader). Replaces the list's compute root signature and pipeline (callers
+/// bind theirs after). False if the clamp is not available.
+pub(crate) fn clamp_uav(
     list: &HostList,
-    buffer: &ID3D12Resource,
     gpu: u64,
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -212,9 +215,6 @@ pub(crate) fn bound(
     {
         return false;
     }
-    let count_buf = count
-        .map(|(b, _)| b)
-        .filter(|b| b.as_raw() != buffer.as_raw());
     let l = &list.list;
     let constants = [kind, stride, records, budget_limit(), u32::from(count.is_some())];
     // SAFETY: an open list; our root signature, pipeline and live buffers
@@ -229,22 +229,42 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, count.map_or(gpu, |(_, g)| g));
         l.Dispatch(records.div_ceil(64), 1, 1);
-        let mut barriers = vec![
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ];
-        if let Some(cb) = count_buf {
-            barriers.push(transition(
-                cb,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ));
-        }
-        l.ResourceBarrier(&barriers);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
+}
+
+/// Records, in `list`, the clamp of `records` records of `kind` (PC
+/// argument numbering) `stride` bytes apart at host address `gpu` in
+/// `buffer` (bounded by `count` when present), and leaves the buffer ready
+/// to be read as arguments. Replaces the list's compute root signature and
+/// pipeline (callers bind theirs after). False if the clamp is not
+/// available.
+pub(crate) fn bound(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> bool {
+    if !clamp_uav(list, gpu, count, spec) {
+        return false;
+    }
+    let mut barriers = vec![transition(
+        buffer,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    if let Some(cb) = count.map(|(b, _)| b).filter(|b| b.as_raw() != buffer.as_raw()) {
+        barriers.push(transition(
+            cb,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ));
+    }
+    // SAFETY: an open list and a live buffer.
+    unsafe {
+        list.list.ResourceBarrier(&barriers);
     }
     true
 }
@@ -272,7 +292,7 @@ pub(crate) fn done(
     unsafe { list.list.ResourceBarrier(&barriers) };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

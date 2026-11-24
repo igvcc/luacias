@@ -15,7 +15,9 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -35,8 +37,10 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
+    /// The [`USES`] count at its last use: the least recently used go
+    /// first when staging buffers pass [`budget`].
+    used: AtomicU64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -54,7 +58,13 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
+}
+
+thread_local! {
+    /// Room to read watched texture memory into before detiling it: one
+    /// buffer per submitting thread, not one the size of every watched
+    /// texture kept for its lifetime.
+    static READ: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -64,6 +74,65 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Bytes of the staging buffers in [`STAGING`]. They live in upload heaps,
+/// that is in host memory counted against the commit limit, one the size
+/// of each texture ever sampled (all mips and slices): without a bound,
+/// loading the world commits gigabytes of them.
+static STAGED: AtomicU64 = AtomicU64::new(0);
+
+/// Texture uses so far: the clock of [`Staging::used`].
+static USES: AtomicU64 = AtomicU64::new(0);
+
+/// The staging bytes kept before the least recently used buffers no list
+/// holds are released (made again, and detiled whole, on their next use):
+/// `VICTORY_STAGING_BUDGET_MB`, 1 GiB by default.
+fn budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// Releases the least recently used staging buffers no list holds until
+/// those kept fit [`budget`] with `more` bytes on top.
+fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
+    let budget = budget();
+    if STAGED.load(Ordering::Relaxed) + more <= budget {
+        return;
+    }
+    // Held only by the map: no list will copy from it, and no submission
+    // still running reads it (lists hold theirs until reset).
+    let mut idle: Vec<(u64, usize, u64)> = map
+        .iter()
+        .filter(|(_, s)| Arc::strong_count(s) == 1)
+        .map(|(&k, s)| (s.used.load(Ordering::Relaxed), k, s.size))
+        .collect();
+    idle.sort_unstable();
+    let mut freed = 0u64;
+    let mut count = 0usize;
+    for (_, key, size) in idle {
+        if STAGED.load(Ordering::Relaxed) + more <= budget {
+            break;
+        }
+        map.remove(&key);
+        STAGED.fetch_sub(size, Ordering::Relaxed);
+        freed += size;
+        count += 1;
+    }
+    if count > 0 {
+        tracing::debug!(
+            count,
+            freed_mib = freed >> 20,
+            kept_mib = STAGED.load(Ordering::Relaxed) >> 20,
+            "texture staging buffers released"
+        );
+    }
+}
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
@@ -79,8 +148,10 @@ pub(crate) fn host_written(resource: This) {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(s) = map.remove(&resource)
+    {
+        STAGED.fetch_sub(s.size, Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -194,9 +265,16 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            READ.with_borrow_mut(|read| {
+                read.resize(size, 0);
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                self.detile(read);
+                // Keep the room for the next texture unless it is far
+                // bigger than usual (a one-off, like a whole pool).
+                if read.capacity() > 64 << 20 {
+                    *read = Vec::new();
+                }
+            });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -279,7 +357,9 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
+    let now = USES.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(s) = map.get(&(resource as usize)) {
+        s.used.store(now, Ordering::Relaxed);
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -319,7 +399,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    evict(map, total);
     let (buffer, data) = host.upload_buffer(total)?;
+    STAGED.fetch_add(total, Ordering::Relaxed);
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -329,8 +411,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
+        used: AtomicU64::new(now),
         data,
         footprints,
         rows,

@@ -40,6 +40,8 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 pub mod raytracing;
+#[cfg(windows)]
+mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
